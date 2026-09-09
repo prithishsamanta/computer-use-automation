@@ -1,0 +1,16 @@
+# Canonical reproducible demo path (.CLAUDE/09_CLAUDE_START_PROMPT.md).
+#
+# Phase 1: just the automation API, to prove the container builds and
+# serves /health. Phase 2 adds a `demo-app` service (the legacy
+# credit-union admin UI). Phase 13 adds Xvfb/x11vnc/noVNC to `automation`
+# so the operator can view/control the same live Playwright session at
+# http://localhost:6080 during a human handoff.
+services:
+  automation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
