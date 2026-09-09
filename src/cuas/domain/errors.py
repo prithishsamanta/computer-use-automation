@@ -32,3 +32,7 @@ class AutomationError(Exception):
 
 class TargetNotFoundError(AutomationError):
     code = ErrorCode.TARGET_NOT_FOUND
+
+
+class ArtifactInvalidError(AutomationError):
+    code = ErrorCode.ARTIFACT_INVALID

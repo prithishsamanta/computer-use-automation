@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     app_name: str = "cuas"
     environment: str = "dev"
+    artifact_dir: str = "data/artifacts"
 
 
 def get_settings() -> Settings:
