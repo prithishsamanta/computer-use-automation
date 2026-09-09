@@ -1,3 +1,4 @@
+from cuas.domain.errors import AutomationError, ErrorCode, TargetNotFoundError
 from cuas.domain.models import (
     AppContext,
     RiskLevel,
@@ -11,6 +12,9 @@ from cuas.domain.models import (
 )
 
 __all__ = [
+    "AutomationError",
+    "ErrorCode",
+    "TargetNotFoundError",
     "AppContext",
     "RiskLevel",
     "ControlState",

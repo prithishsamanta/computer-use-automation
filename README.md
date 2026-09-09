@@ -19,6 +19,7 @@ architecture writeup.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+python -m playwright install chromium   # needed once, for the integration tests / real browser automation
 python -m pytest -q -m "not live_llm"
 ```
 

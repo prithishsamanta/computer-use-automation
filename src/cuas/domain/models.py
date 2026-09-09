@@ -9,7 +9,7 @@ for the source design decisions these types encode.
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -30,7 +30,7 @@ class AppContext(BaseModel):
     tenant_id: str
 
 
-class RiskLevel(StrEnum):
+class RiskLevel(str, Enum):
     """The three action categories from .CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md.
 
     This is informational metadata carried on an Action/Step. It is never
@@ -45,7 +45,7 @@ class RiskLevel(StrEnum):
     BLOCKED = "blocked"
 
 
-class ControlState(StrEnum):
+class ControlState(str, Enum):
     """Human handoff control state machine (.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md)."""
 
     RUNNING_AUTOMATION = "running_automation"
@@ -54,14 +54,14 @@ class ControlState(StrEnum):
     RESUME_REQUESTED = "resume_requested"
 
 
-class InterventionStatus(StrEnum):
+class InterventionStatus(str, Enum):
     PENDING = "pending"
     CLAIMED = "claimed"
     RESOLVED = "resolved"
     CANCELLED = "cancelled"
 
 
-class LocatorStrategy(StrEnum):
+class LocatorStrategy(str, Enum):
     """Preferred-to-last-resort target resolution order from
     .CLAUDE/03_DISCOVERY_AND_REPLAY.md. A Target's fallback chain should be
     ordered by this preference, most stable first.
@@ -103,7 +103,7 @@ class Target(BaseModel):
     fallbacks: list[Locator] = Field(default_factory=list)
 
 
-class ActionType(StrEnum):
+class ActionType(str, Enum):
     NAVIGATE = "navigate"
     CLICK = "click"
     FILL = "fill"

@@ -19,6 +19,9 @@ jobs:
       - name: Install project
         run: pip install -e ".[dev]"
 
+      - name: Install Playwright browser (chromium)
+        run: python -m playwright install --with-deps chromium
+
       # Excludes `live_llm` tests (need ANTHROPIC_API_KEY and hit a real
       # provider, so they are not part of the required, deterministic CI
       # gate -- see .CLAUDE/09_CLAUDE_START_PROMPT.md and the testing
