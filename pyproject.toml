@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.4",
+    "jinja2>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -26,7 +27,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 markers = [
     "integration: exercises a real PlaywrightSurfaceAdapter against the demo app, no LLM",

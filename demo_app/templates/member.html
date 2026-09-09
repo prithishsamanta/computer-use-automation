@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<table class="legacy-table">
+  <tr><th>Member ID</th><td>{{ member.id }}</td></tr>
+  <tr><th>Name</th><td>{{ member.first_name }} {{ member.last_name }}</td></tr>
+</table>
+
+<p><b>Accounts</b></p>
+<iframe id="accounts-frame" src="/members/{{ member.id }}/accounts" width="100%" height="260" style="border:1px solid #999;"></iframe>
+{% endblock %}

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Meridian Credit Union - Member Services{% endblock %}</title>
+  <style>
+    body { font-family: Tahoma, Arial, sans-serif; font-size: 13px; background: #d6d3ce; margin: 0; }
+    table { border-collapse: collapse; }
+    #banner { background: #003366; color: #fff; padding: 6px 12px; font-size: 16px; font-weight: bold; }
+    #content { background: #ffffff; margin: 12px; padding: 12px; border: 1px solid #888; }
+    .legacy-table td, .legacy-table th { border: 1px solid #999; padding: 4px 8px; }
+    .legacy-table th { background: #e8e6e0; text-align: left; }
+    .msg-not-found { color: #a00; font-weight: bold; }
+    .msg-closed { color: #060; font-weight: bold; }
+    a.action-link { color: #003366; }
+  </style>
+</head>
+<body>
+  <div id="banner">Meridian Credit Union &mdash; Member Services</div>
+  <div id="content">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

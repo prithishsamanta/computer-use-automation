@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+{% if account is none %}
+<p class="msg-not-found">Account not found.</p>
+{% else %}
+<p>Are you sure you want to close account {{ account.id }} ({{ account.type }})? This cannot be undone.</p>
+<form action="/members/{{ member.id }}/accounts/{{ account.id }}/close" method="post" style="display:inline;">
+  <input type="submit" value="Confirm Close">
+</form>
+<a class="action-link" href="/members/{{ member.id }}/accounts" style="margin-left:12px;">Cancel</a>
+{% endif %}
+{% endblock %}

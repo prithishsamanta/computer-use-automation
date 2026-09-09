@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+{% if member is none %}
+<p class="msg-not-found">Member not found.</p>
+{% else %}
+<table class="legacy-table" id="tbl1">
+  <tr><td><b>Type</b></td><td><b>Account #</b></td><td><b>Balance</b></td><td><b>Status</b></td><td></td></tr>
+  {% for a in member.accounts %}
+  <tr id="acct-row-{{ loop.index }}">
+    <td>{{ a.type | capitalize }}</td>
+    <td>{{ a.id }}</td>
+    <td>${{ "%.2f"|format(a.balance) }}</td>
+    <td>{% if a.status == "closed" %}<span class="msg-closed">Closed</span>{% else %}Open{% endif %}</td>
+    <td>
+      {% if a.status == "open" %}
+      <a class="action-link" href="/members/{{ member.id }}/accounts/{{ a.id }}/close-confirm">Close Account</a>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

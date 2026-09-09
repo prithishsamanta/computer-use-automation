@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<div id="session-notice-overlay" style="position:fixed; top:0; left:0; width:100%; height:100%;
+     background:rgba(0,0,0,0.45); display:flex; align-items:center; justify-content:center; z-index:999;">
+  <div style="background:#fff; border:1px solid #444; padding:16px 20px; width:320px;">
+    <p id="session-notice-text">A new session has started for this workstation.</p>
+    <button id="dismiss-session-notice" type="button"
+            onclick="document.getElementById('session-notice-overlay').style.display='none';">
+      OK
+    </button>
+  </div>
+</div>
+
+<table class="legacy-table">
+  <tr>
+    <td>Member ID or Last Name</td>
+    <td>
+      <form action="/search" method="get">
+        <input type="text" name="query" value="{{ query }}">
+        <input type="submit" value="Search">
+      </form>
+    </td>
+  </tr>
+</table>
+
+{% if not_found %}
+<p class="msg-not-found">Member not found.</p>
+{% endif %}
+
+{% if results %}
+<table class="legacy-table">
+  <tr><th>Member ID</th><th>Last Name</th><th>First Name</th><th></th></tr>
+  {% for m in results %}
+  <tr>
+    <td>{{ m.id }}</td>
+    <td>{{ m.last_name }}</td>
+    <td>{{ m.first_name }}</td>
+    <td><a class="action-link" href="/members/{{ m.id }}">View</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
