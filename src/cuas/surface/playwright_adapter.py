@@ -14,6 +14,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator as PlaywrightLocator
 from playwright.async_api import Page, async_playwright
 
@@ -85,19 +86,32 @@ class PlaywrightSurfaceAdapter(SurfaceAdapter):
     async def observe(self) -> Observation:
         return Observation(url=self._page.url, visible_text=await self._page.inner_text("body"))
 
-    async def click(self, target: Target) -> None:
+    async def click(self, target: Target, *, timeout_ms: int | None = None) -> None:
         resolved = await self._resolve(target, "click")
         if isinstance(resolved, tuple):
             x, y = resolved
             await self._page.mouse.click(x, y)
-        else:
-            await resolved.click()
+            return
+        try:
+            await resolved.click(timeout=timeout_ms or FALLBACK_CANDIDATE_TIMEOUT_MS)
+        except PlaywrightError as exc:
+            # Resolution succeeded (the element exists) but Playwright's own
+            # actionability check failed -- e.g. something is covering it
+            # (the demo app's session-notice overlay). From ReplayEngine's
+            # perspective that is the same class of problem as not finding
+            # the element at all: it could not safely interact with the
+            # target, which is exactly the case recoverable_conditions and
+            # bounded retry exist for (.CLAUDE/03_DISCOVERY_AND_REPLAY.md).
+            raise TargetNotFoundError(f"click did not become actionable: {exc}") from exc
 
-    async def fill(self, target: Target, value: str) -> None:
+    async def fill(self, target: Target, value: str, *, timeout_ms: int | None = None) -> None:
         resolved = await self._resolve(target, "fill")
         if isinstance(resolved, tuple):
             raise TargetNotFoundError("Cannot fill a value at raw coordinates; no element resolved")
-        await resolved.fill(value)
+        try:
+            await resolved.fill(value, timeout=timeout_ms or FALLBACK_CANDIDATE_TIMEOUT_MS)
+        except PlaywrightError as exc:
+            raise TargetNotFoundError(f"fill did not become actionable: {exc}") from exc
 
     async def read(self, target: Target) -> str:
         resolved = await self._resolve(target, "read")

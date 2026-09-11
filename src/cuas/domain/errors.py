@@ -36,3 +36,11 @@ class TargetNotFoundError(AutomationError):
 
 class ArtifactInvalidError(AutomationError):
     code = ErrorCode.ARTIFACT_INVALID
+
+
+class CheckpointFailedError(AutomationError):
+    code = ErrorCode.CHECKPOINT_FAILED
+
+
+class OutputExtractionFailedError(AutomationError):
+    code = ErrorCode.OUTPUT_EXTRACTION_FAILED

@@ -110,3 +110,34 @@ def get_savings_balance(version: str = "1.0.0") -> Artifact:
         safety=ArtifactSafety(intent="view_savings_balance", risk=RiskLevel.SAFE),
         provenance=Provenance(created_from_run="manual-authoring-phase4", created_at=datetime.now(timezone.utc)),
     )
+
+
+def _single_step_capability(capability_id: str, risk: RiskLevel) -> Artifact:
+    """A minimal one-step artifact used only to exercise ReplayEngine's
+    policy branching (APPROVAL_REQUIRED / BLOCKED) without needing a real
+    risky control in the demo UI for every case."""
+
+    target = Target(primary=_role("button", "Go"))
+    return Artifact(
+        capability_id=capability_id,
+        name=capability_id,
+        description="Test fixture for policy branch coverage.",
+        version="1.0.0",
+        application=ArtifactApplication(vendor="test-vendor", application="test-app", supported_versions=["1.x"]),
+        inputs={},
+        outputs={"result": OutputSpec(type=OutputType.STRING, source=target)},
+        steps=[
+            Step(id="only_step", action_type=ActionType.CLICK, intent="do_the_risky_thing", target=target, risk=risk)
+        ],
+        success_condition=SuccessCondition(type=SuccessConditionType.OUTPUT_VALID, output="result"),
+        safety=ArtifactSafety(intent="do_the_risky_thing", risk=risk),
+        provenance=Provenance(created_from_run="test-fixture", created_at=datetime.now(timezone.utc)),
+    )
+
+
+def approval_required_capability() -> Artifact:
+    return _single_step_capability("approval_required_capability", RiskLevel.APPROVAL_REQUIRED)
+
+
+def blocked_capability() -> Artifact:
+    return _single_step_capability("blocked_capability", RiskLevel.BLOCKED)
