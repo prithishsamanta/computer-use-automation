@@ -13,7 +13,7 @@ import pytest
 
 from cuas.domain import AppContext, ErrorCode, TargetNotFoundError
 from cuas.replay import ReplayEngine, ReplayStatus
-from cuas.safety import RiskBasedPolicyEngine
+from cuas.safety import LayeredPolicyEngine, RiskBasedPolicyEngine
 from tests.fixtures.fake_surface import FakeSurfaceAdapter
 from tests.fixtures.sample_artifacts import approval_required_capability, blocked_capability, get_savings_balance
 
@@ -22,6 +22,29 @@ CONTEXT = AppContext(vendor="meridian-demo", application="credit-union-admin", v
 
 def _engine(fake: FakeSurfaceAdapter) -> ReplayEngine:
     return ReplayEngine(fake, RiskBasedPolicyEngine())
+
+
+@pytest.mark.asyncio
+async def test_layered_policy_engine_is_a_drop_in_replacement_for_risk_based_policy() -> None:
+    """ReplayEngine depends on the PolicyEngine ABC, not a concrete class
+    (.CLAUDE/01_ARCHITECTURE.md). Swapping in Phase 6's LayeredPolicyEngine
+    -- with no app/tenant policy configured, so get_savings_balance's own
+    intents ("enter_member_id", "submit_member_search") fall through to
+    its risk-fallback -- must replay the real capability identically to
+    Phase 5's RiskBasedPolicyEngine. This is the regression check for
+    "preserve current replay behavior" while moving the runtime policy
+    engine forward.
+    """
+
+    artifact = get_savings_balance()
+    fake = FakeSurfaceAdapter()
+    fake.script_read(artifact.outputs["savings_balance"].source, "$18204.55")
+
+    engine = ReplayEngine(fake, LayeredPolicyEngine())
+    result = await engine.run(artifact, {"member_id": "M1001"}, CONTEXT)
+
+    assert result.status == ReplayStatus.SUCCESS
+    assert result.outputs["savings_balance"] == Decimal("18204.55")
 
 
 @pytest.mark.asyncio

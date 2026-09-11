@@ -185,8 +185,9 @@ Default branch: `main`.
 5. ✅ Deterministic `ReplayEngine` (safety-policy seam, bounded recovery,
    checkpoints, business outcomes, typed output extraction) — commit
    `ec85f4b`.
-6. ⬜ Fuller layered `PolicyEngine` (replacing Phase 5's 1:1
-   `RiskBasedPolicyEngine` placeholder).
+6. ✅ Fuller layered `PolicyEngine` (global -> app/vendor -> tenant),
+   replacing Phase 5's 1:1 `RiskBasedPolicyEngine` placeholder as the real
+   runtime policy (see Phase Log).
 7. ⬜ Structured logging / evidence capture (observability package).
 8. ⬜ LLM discovery loop, built and tested against fakes first.
 9. ⬜ Artifact builder (discovery run → cleaned, typed artifact).
@@ -248,3 +249,65 @@ Default branch: `main`.
   (34 passed) before committing.
 - Committed locally; user has since pushed it themselves (`main` shows "up
   to date with origin/main" as of this log entry).
+
+
+### Phase 6 — Layered PolicyEngine
+
+- Built `LayeredPolicyEngine` in `src/cuas/safety/policy.py`
+  (`.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md`, "Layered Policy Model"):
+  global safety defaults -> vendor/application policy -> tenant-specific
+  overrides. Each layer is an `IntentPolicy` — a plain
+  `intent -> PolicyDecision` lookup table, nothing more. `DEFAULT_GLOBAL_INTENT_POLICY`
+  encodes the doc's own SAFE/APPROVAL_REQUIRED/BLOCKED intent examples.
+- **Combination rule (the entire policy, deliberately not a rules
+  engine):** collect every opinion that applies — global's, the
+  (vendor, application)-scoped app layer's, the
+  (vendor, application, tenant_id)-scoped tenant layer's, and the action's
+  own explicitly-declared `risk` as one more opinion — and return the
+  single MOST RESTRICTIVE one. Consequences, all deliberate and all
+  covered by tests: a more specific layer can tighten a broader layer's
+  decision, but can never loosen one (a tenant can't turn a globally
+  BLOCKED or APPROVAL_REQUIRED intent into ALLOW, even by declaring it
+  ALLOW itself); an intent-based classification always overrides a
+  self-reported `risk`, never the reverse.
+- **Closed the "silently permissive default" trap explicitly**, since it's
+  a real one: `Action.risk: RiskLevel = RiskLevel.SAFE` has a default, so
+  an `Action` built without setting `risk` (e.g. a future discovery
+  proposal that forgot to classify itself) is indistinguishable from one
+  explicitly marked SAFE *unless* something checks
+  `action.model_fields_set`. `LayeredPolicyEngine` does exactly that: an
+  action whose intent matches no layer AND whose `risk` was never
+  explicitly set contributes **no opinions at all**, and with no opinions
+  the engine returns `REQUIRE_APPROVAL`, never `ALLOW` — it fails closed
+  instead of guessing. An action with a genuinely explicit `risk` (however
+  set) is still trusted as a fallback opinion when no layer recognizes its
+  intent, so this doesn't regress hand-authored artifacts.
+- `RiskBasedPolicyEngine` (Phase 5) is kept as-is — still a valid, simpler
+  `PolicyEngine`, and `LayeredPolicyEngine`'s own risk-fallback reuses its
+  `RiskLevel -> PolicyDecision` mapping (now a shared module constant,
+  `RISK_TO_DECISION`).
+- `ReplayEngine` required **zero changes** — it already depended only on
+  the `PolicyEngine` ABC. Added
+  `test_layered_policy_engine_is_a_drop_in_replacement_for_risk_based_policy`
+  in `tests/unit/test_replay_engine.py`, which replays the real
+  `get_savings_balance` artifact through a `LayeredPolicyEngine` (with no
+  app/tenant policy configured, so its own step intents fall through to
+  the risk-fallback) and asserts identical `SUCCESS` behavior to Phase 5 —
+  the concrete regression check for "preserve current replay behavior."
+- `tests/unit/test_policy_engine.py`: 13 tests covering global-layer
+  SAFE/APPROVAL_REQUIRED/BLOCKED classification, an app layer tightening
+  an intent the global layer has no opinion on (and staying scoped to its
+  own vendor/app), a tenant layer tightening beyond the app layer (and
+  falling back correctly for tenants with no override), a tenant unable to
+  loosen a broader BLOCKED or APPROVAL_REQUIRED decision, an unclassified
+  intent with an explicit risk being trusted, and the core
+  unclassified-without-explicit-risk case failing closed to
+  `REQUIRE_APPROVAL` (asserted against the actual pydantic mechanism —
+  `model_fields_set` — that makes the trap real).
+- Verified via the cloud-sandbox round-trip: 56 tests pass total (48 unit
+  + 8 integration), no regressions from touching `safety/policy.py` alone
+  (no `SurfaceAdapter`/Playwright changes this phase). On-device unit
+  suite reconfirmed green (48 passed) before committing.
+- Discovery (Phase 8) is expected to call this same `LayeredPolicyEngine`
+  before executing any proposed action — no interface change needed for
+  that; it's already the shared `PolicyEngine` ABC both callers will use.
