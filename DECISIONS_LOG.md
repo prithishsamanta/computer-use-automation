@@ -76,7 +76,14 @@ Default branch: `main`.
   treat Docker as "unavailable" because of that. Write real
   Dockerfile/Compose content, mark container execution as "unverified from
   this sandbox" in comments, and let the user run
-  `docker compose build`/`up` themselves.
+  `docker compose build`/`up` themselves. (Confirmed working as of Phase
+  13: the user ran `docker compose build`/`up` for real and reported
+  success — see that phase's Phase Log entry. The rule itself still
+  stands for every future Docker change: write it, flag it as
+  sandbox-unverified, let the user run and confirm it, then update the
+  relevant comments/README once they do — don't leave a stale
+  "unverified" claim sitting in the repo once it's actually been
+  verified.)
 - **Per-phase loop**: implement → write/extend tests → run tests → (for
   anything needing a real browser) verify via the cloud-sandbox round-trip
   (§5) → commit locally with a detailed message → report results and wait
@@ -1260,7 +1267,8 @@ Default branch: `main`.
   avoid adding a package to either image just for this) and made
   `automation` `depends_on: demo-app: condition: service_healthy`, so
   Compose won't start automation racing an unready demo-app.
-- **Non-Docker verification, explicitly bounded:** this sandbox has no
+- **Non-Docker verification, explicitly bounded (as originally written --
+  see the "Update" bullet below for what happened next):** this sandbox has no
   Docker CLI/socket access, so `docker compose build`/`up` were not run
   against the actual images -- that remains the user's own
   `docker compose build && docker compose up` on their Mac, exactly as
@@ -1278,7 +1286,9 @@ Default branch: `main`.
   the shell script looks right," but it is still not a substitute for an
   actual `docker compose build && up` -- flagged as such in README.md and
   both Docker files' own comments, per the standing instruction never to
-  claim Docker verification that didn't happen.
+  claim Docker verification that didn't happen. (Superseded below: the
+  user has since run the actual `docker compose build && up` and
+  confirmed it.)
 - **Tests** (8 new, all pure non-Docker unit tests -- no browser, no
   Docker daemon, no Xvfb needed to run them):
   `tests/unit/test_settings.py` (3 tests) covers
@@ -1302,3 +1312,18 @@ Default branch: `main`.
 - **Not built this phase, by explicit instruction:** no Kubernetes, no
   browser farm, no external queue, no remote browser service. Still a
   single Compose file, two services, direct synchronous orchestration.
+- **Update -- real Docker verification, on the user's actual Mac:**
+  `docker compose build` completed successfully, both services started,
+  `GET http://localhost:8000/health` returned 200, Xvfb/x11vnc/noVNC all
+  started correctly inside the `automation` container, and the Compose
+  network between `automation` and `demo-app` works. This phase's Docker
+  setup is no longer unverified-by-build -- README.md's Docker section
+  and docker-compose.yml's own top comment have been updated to say so
+  instead of the earlier "not run from here" framing (which remains true
+  of the sandbox itself, just no longer true of this build's actual
+  status). Still pending, and explicitly not yet claimed as done: the
+  noVNC same-session intervention/resume flow specifically (README's
+  checklist steps 4-9 -- trigger a run to intervention, watch/claim/
+  manipulate the paused browser over noVNC, resume, confirm it continues
+  the same run/session). The user is running that check next; Phase 14
+  does not start until they confirm it.

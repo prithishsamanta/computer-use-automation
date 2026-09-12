@@ -79,20 +79,24 @@ capabilities, logs, evidence, discovery traces, interventions) is a bind
 mount, so it persists across `docker compose up` / `down` cycles and is
 inspectable directly on the host.
 
-**Verification status:** the Dockerfile/Compose config in this repo,
-including Phase 13's Xvfb/x11vnc/noVNC additions, is authored and
-reasoned about from a sandboxed environment that has no Docker CLI/socket
-access -- `docker compose build` / `up` have not been run against any of
-it from there. The individual pieces (headed-Chromium launch args under
-Xvfb, and the full Xvfb -> x11vnc -> noVNC chain end to end, including a
-real headed Chromium actually rendering onto the display x11vnc/noVNC
-serve) were exercised directly against a real Playwright/Chromium install
-outside Docker to build confidence in the mechanism, but that is not the
-same as a verified `docker compose build && docker compose up` on the
-actual images. Docker itself is installed and working on the developer's
-own Mac, and `docker compose build` / `up` are run and verified from that
-real terminal. Treat any given commit's Docker setup as
-unverified-by-build until that check has actually been run there.
+**Verification status:** confirmed on the developer's real Mac.
+`docker compose build` completed successfully, both services started,
+`GET http://localhost:8000/health` returned 200, Xvfb/x11vnc/noVNC all
+started correctly inside the `automation` container, and the Compose
+network between `automation` and `demo-app` works. This repo's Docker
+setup (Phase 13's Xvfb/x11vnc/noVNC additions included) is build- and
+startup-verified, not just authored/reasoned about from a sandbox without
+Docker CLI/socket access -- that sandbox limitation is still real (it's
+why this verification could only happen on the developer's own machine,
+not from the tool session that wrote the config), but it no longer means
+"untested"; it was tested, on the actual target machine.
+
+Still being manually confirmed: the noVNC same-session intervention/
+resume flow specifically -- steps 4-9 below (trigger a run to
+intervention, watch the paused browser over noVNC, claim it, manipulate
+it, and confirm resume continues the same run/session on the same
+browser). Startup/health/network are verified; that flow is the next
+thing being checked, and Phase 14 is on hold until it is.
 
 ### Manual verification checklist (Phase 13: live-session handoff via noVNC)
 
