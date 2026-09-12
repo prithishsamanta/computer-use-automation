@@ -37,6 +37,16 @@ class InputSpec(BaseModel):
     type: str = "string"
     required: bool = True
     description: str = ""
+    sensitive: bool = Field(
+        default=False,
+        description=(
+            "If true, this input's raw value must not be persisted in structured logs "
+            "or evidence (.CLAUDE/04, 'Sensitive Data'; .CLAUDE/06, 'Observability must "
+            "not become a data-leak mechanism') -- e.g. a member ID. Enforced by "
+            "cuas.observability.redaction.redact_inputs, called on ReplayEngine's "
+            "run_started event."
+        ),
+    )
 
 
 class OutputType(str, Enum):

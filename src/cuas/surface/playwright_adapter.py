@@ -11,6 +11,7 @@ and bounded").
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -135,7 +136,36 @@ class PlaywrightSurfaceAdapter(SurfaceAdapter):
     async def capture_evidence(self) -> Evidence:
         screenshot = await self._page.screenshot()
         text = await self._page.inner_text("body")
-        return Evidence(url=self._page.url, screenshot_png=screenshot, visible_text_excerpt=text[:2000])
+        dom_snapshot = await self._capture_dom_snapshot()
+        return Evidence(
+            url=self._page.url,
+            screenshot_png=screenshot,
+            visible_text_excerpt=text[:2000],
+            dom_snapshot=dom_snapshot,
+        )
+
+    # Accessibility-tree snapshot (.CLAUDE/06_ERRORS_AND_OBSERVABILITY.md,
+    # "Rich Failure Evidence": "DOM snapshot or accessibility snapshot").
+    # Deliberately thin -- one Playwright call, truncated, best-effort.
+    # This must never be allowed to fail evidence capture as a whole: a
+    # missing snapshot is a much smaller loss than losing the screenshot
+    # and URL over an unrelated accessibility-tree quirk.
+    _MAX_DOM_SNAPSHOT_CHARS = 20_000
+
+    async def _capture_dom_snapshot(self) -> str | None:
+        try:
+            tree = await self._page.accessibility.snapshot()
+        except Exception:  # noqa: BLE001 - best-effort, never fatal to evidence capture
+            return None
+        if tree is None:
+            return None
+        try:
+            snapshot = json.dumps(tree)
+        except (TypeError, ValueError):
+            return None
+        if len(snapshot) <= self._MAX_DOM_SNAPSHOT_CHARS:
+            return snapshot
+        return snapshot[: self._MAX_DOM_SNAPSHOT_CHARS] + "...<truncated>"
 
 
 @asynccontextmanager

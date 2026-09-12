@@ -61,7 +61,13 @@ def get_savings_balance(version: str = "1.0.0") -> Artifact:
         tenant_scope="base",
         inputs={
             "member_id": InputSpec(
-                type="string", required=True, description="Institution member identifier"
+                type="string",
+                required=True,
+                description="Institution member identifier",
+                # A real member ID is PII -- Phase 7's ReplayEngine must not
+                # write its raw value into structured logs (run_started's
+                # inputs are redacted for any input marked sensitive here).
+                sensitive=True,
             )
         },
         outputs={

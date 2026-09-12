@@ -188,7 +188,7 @@ Default branch: `main`.
 6. ✅ Fuller layered `PolicyEngine` (global -> app/vendor -> tenant),
    replacing Phase 5's 1:1 `RiskBasedPolicyEngine` placeholder as the real
    runtime policy (see Phase Log).
-7. ⬜ Structured logging / evidence capture (observability package).
+7. ✅ Structured logging / evidence capture (observability package).
 8. ⬜ LLM discovery loop, built and tested against fakes first.
 9. ⬜ Artifact builder (discovery run → cleaned, typed artifact).
 10. ⬜ Capability service (context/version/tenant resolution at call time).
@@ -311,3 +311,102 @@ Default branch: `main`.
 - Discovery (Phase 8) is expected to call this same `LayeredPolicyEngine`
   before executing any proposed action — no interface change needed for
   that; it's already the shared `PolicyEngine` ABC both callers will use.
+
+
+### Phase 7 — Structured logging and evidence capture
+
+- New `cuas.observability` modules: `events.py` (`EventType`, `RunEvent`
+  in `.CLAUDE/06_ERRORS_AND_OBSERVABILITY.md`'s own suggested shape --
+  timestamp/run_id/component/event/step_id/status/details), `event_sink.py`
+  (`EventSink` ABC + `NullEventSink` + `JsonlEventSink`, one JSONL file per
+  run_id under `Settings.log_dir`), `evidence.py` (`EvidenceStore` ABC +
+  `NullEvidenceStore` + `FileEvidenceStore`, one directory per run_id under
+  `Settings.evidence_dir`), `redaction.py` (`redact_inputs`). Same
+  one-ABC-one-real-implementation shape as `SurfaceAdapter`/`PolicyEngine`/
+  `ArtifactRepository`.
+- `ReplayEngine` now takes optional `event_sink`/`evidence_store`
+  constructor args (both default to no-op implementations) and an optional
+  `run_id` on `run()` (default: a fresh `uuid4`). Emits all 11 requested
+  events (`run_started`, `artifact_loaded`, `step_started`,
+  `policy_checked`, `action_executed`, `checkpoint_passed`,
+  `business_outcome_detected`, `recovery_attempted`, `step_failed`,
+  `evidence_captured`, `run_completed`) at the appropriate points in the
+  existing, *unchanged* algorithm. `ReplayResult` gained a `run_id` field
+  (always set; no test ever constructed a `ReplayResult` by hand, so this
+  was a safe additive change). Zero changes to control flow -- every
+  Phase 5/6 test still passes unmodified, because a caller that doesn't
+  pass `event_sink`/`evidence_store` gets byte-for-byte the same behavior
+  as before.
+- **`artifact_loaded` placement, a deliberate stand-in:** `ReplayEngine`
+  doesn't itself load artifacts (it receives one already loaded), so this
+  event fires right after input validation succeeds, not from
+  `ArtifactRepository`. Documented in code as provisional -- Phase 10's
+  `CapabilityService`/`ArtifactRepository` integration is the real home for
+  this event once retrieval-by-context exists; wiring it there later needs
+  no interface change, just a second `EventSink.record` call site.
+- **Evidence capture is scoped strictly to the FAILED path** (step
+  execution failure, checkpoint failure after exhausted recovery, output
+  extraction failure, success-condition failure) -- never on
+  `BUSINESS_OUTCOME` (a valid state, not a failure) or on
+  `APPROVAL_REQUIRED`/`BLOCKED` (a policy decision made before the surface
+  was ever touched -- nothing to capture). This is what "normal success
+  paths do not generate unnecessary heavy evidence" meant in practice, and
+  it's covered by explicit tests for all three non-failure paths.
+- **Redaction, precisely scoped:** `InputSpec` gained `sensitive: bool =
+  False`; `redact_inputs(artifact, inputs)` swaps a sensitive input's raw
+  value for `[REDACTED]` before it can reach the `run_started` event
+  (the only place raw invocation inputs are ever formatted into a log
+  line). `get_savings_balance`'s `member_id` is now marked `sensitive=True`
+  as the concrete example. Realized while implementing that
+  `action_executed` needed no redaction logic of its own: it logs a step's
+  *value template* (e.g. `"{{member_id}}"`), never the substituted value,
+  so a resolved sensitive input is never formatted into a log line in the
+  first place -- there's nothing to strip because the leak can't occur by
+  construction. This is documented explicitly in `redaction.py`'s
+  docstring so a future contributor doesn't "fix" `action_executed` by
+  bolting on redaction it doesn't need (or, worse, skip redacting a
+  genuinely new leak path because they assume this one already covers it).
+- **Screenshots are explicitly NOT treated as redacted**, per the user's
+  specific instruction to state this plainly rather than let "redaction"
+  cover for it: `EvidenceRecord.screenshot_is_unredacted_pii_risk` is set
+  `True` on every record that includes a screenshot. `evidence.py`'s
+  module docstring spells out why (a screenshot is a pixel-for-pixel
+  picture of whatever was on screen -- a member ID, a balance -- and there
+  is no general, reliable way to black that out without destroying the
+  evidence's own purpose) and states plainly that the evidence directory
+  needs the same access-control discipline as raw PII: excluded from
+  version control (`data/evidence/` and `data/logs/` added to
+  `.gitignore` this phase, alongside the pre-existing `data/*.db`), not
+  attached to bug reports, access-restricted in any real deployment. Only
+  the *textual* metadata stored alongside a screenshot is subject to the
+  same redaction discipline as any other log content.
+- **Thin accessibility/DOM snapshot**, "if practical" per the instructions:
+  `Evidence` gained an optional `dom_snapshot` field; `PlaywrightSurfaceAdapter.
+  capture_evidence()` calls Playwright's `page.accessibility.snapshot()`,
+  serializes it to JSON, and truncates at 20,000 characters. Wrapped in a
+  bare `except Exception: return None` -- a missing snapshot must never
+  block capturing the screenshot/URL/text that evidence capture exists
+  for. Verified for real (not just import-checked) against the live demo
+  app in the cloud-sandbox round-trip: a real run there produces a real,
+  non-empty accessibility-tree JSON file alongside a real PNG screenshot.
+- Evidence capture is itself best-effort: if `surface.capture_evidence()`
+  raises, `ReplayEngine._capture_failure_evidence` catches it and proceeds
+  with `evidence=None` (so `EvidenceStore` still gets a call recording the
+  reason/error/recent-actions with no screenshot) -- a problem capturing
+  evidence must never mask or replace the run's real, primary failure.
+- `tests/unit/test_event_sink.py` (3), `test_evidence_store.py` (5, incl.
+  the explicit `screenshot_is_unredacted_pii_risk=True` assertion and a
+  sequence-numbering-avoids-collisions case), `test_redaction.py` (3, incl.
+  a hand-built artifact with one sensitive and one non-sensitive input to
+  prove redaction doesn't become "hide everything"), and 8 new tests
+  appended to `test_replay_engine.py` (event sequence + run_id correlation
+  for a success run, explicit `run_id` threading, redaction of
+  `run_started`'s inputs, `action_executed`'s value-template-not-value
+  behavior, and the three "no evidence on a non-failure path" cases plus
+  one real hard-failure-captures-evidence case using a real
+  `FileEvidenceStore` against `tmp_path`). Plus one new real-browser
+  integration test verifying actual PNG bytes and a real non-empty
+  accessibility-tree snapshot land on disk from one real failed run.
+- Verified via the cloud-sandbox round-trip: 76 tests pass total (67 unit
+  + 9 integration), no regressions. On-device unit suite reconfirmed green
+  (67 passed) before committing.

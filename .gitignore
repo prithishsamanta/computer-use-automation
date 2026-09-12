@@ -8,5 +8,11 @@ venv/
 .env
 data/*.db
 data/*.sqlite3
+# Runtime evidence/logs can contain real PII (member IDs, unredacted
+# screenshots -- see cuas.observability.evidence's module docstring).
+# data/artifacts/ IS committed on purpose (reviewable versioned
+# artifacts); these are not.
+data/evidence/
+data/logs/
 .DS_Store
 node_modules/

@@ -40,6 +40,7 @@ class FakeSurfaceAdapter(SurfaceAdapter):
         self._fill: dict[str, list[Exception | None]] = {}
         self._wait: dict[str, list[Exception | None]] = {}
         self._read: dict[str, list[Exception | str]] = {}
+        self._evidence: Evidence | None = None
 
     def script_click(self, target: Target, *results: Exception | None) -> None:
         self._click[_target_key(target)] = list(results)
@@ -52,6 +53,13 @@ class FakeSurfaceAdapter(SurfaceAdapter):
 
     def script_read(self, target: Target, *results: Exception | str) -> None:
         self._read[_target_key(target)] = list(results)
+
+    def script_evidence(self, evidence: Evidence) -> None:
+        """Override what capture_evidence() returns. Unscripted, it
+        returns an empty/harmless Evidence -- fine for tests that only
+        care *whether* evidence capture happened, not its contents (those
+        are covered directly in tests/unit/test_evidence_store.py)."""
+        self._evidence = evidence
 
     def _pop(self, scripts: dict[str, list], key: str, default: Any) -> Any:
         queue = scripts.get(key)
@@ -92,4 +100,6 @@ class FakeSurfaceAdapter(SurfaceAdapter):
 
     async def capture_evidence(self) -> Evidence:
         self.calls.append(("capture_evidence",))
+        if self._evidence is not None:
+            return self._evidence
         return Evidence(url=self.url, screenshot_png=b"", visible_text_excerpt="")

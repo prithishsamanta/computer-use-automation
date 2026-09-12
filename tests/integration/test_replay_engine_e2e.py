@@ -24,9 +24,11 @@ from decimal import Decimal
 import pytest
 
 from cuas.domain import AppContext
+from cuas.observability import EventType, FileEvidenceStore
 from cuas.replay import ReplayEngine, ReplayStatus
 from cuas.safety import RiskBasedPolicyEngine
 from cuas.surface.playwright_adapter import launch_playwright_surface
+from tests.fixtures.in_memory_event_sink import InMemoryEventSink
 from tests.fixtures.sample_artifacts import get_savings_balance
 
 pytestmark = pytest.mark.integration
@@ -92,3 +94,42 @@ async def test_ambiguous_match_with_no_known_outcome_is_a_hard_failure(demo_app_
     assert result.error_code is not None
     assert result.escalation_step_id is None  # FAILED carries error_code, not an approval/deny escalation
     assert any(e.event == "checkpoint_failed" for e in result.step_log)
+
+
+@pytest.mark.asyncio
+async def test_hard_failure_captures_real_evidence_including_screenshot_and_accessibility_snapshot(
+    demo_app_base_url: str, tmp_path
+) -> None:
+    """Phase 7's evidence wiring, proven against a *real* browser, not
+    FakeSurfaceAdapter (tests/unit/test_replay_engine.py already covers
+    the orchestration logic in isolation): a real screenshot, a real
+    accessibility-tree snapshot from Playwright, and a redacted run_started
+    event all get produced from one real failed run."""
+
+    sink = InMemoryEventSink()
+    evidence_store = FileEvidenceStore(tmp_path)
+
+    async with launch_playwright_surface() as surface:
+        await surface.navigate(demo_app_base_url + "/")
+
+        engine = ReplayEngine(
+            surface, RiskBasedPolicyEngine(), event_sink=sink, evidence_store=evidence_store
+        )
+        result = await engine.run(get_savings_balance(), {"member_id": "Smith"}, CONTEXT)
+
+    assert result.status == ReplayStatus.FAILED
+
+    run_started = sink.events_of(EventType.RUN_STARTED)[0]
+    assert run_started.details["inputs"] == {"member_id": "[REDACTED]"}
+
+    evidence_events = sink.events_of(EventType.EVIDENCE_CAPTURED)
+    assert len(evidence_events) == 1
+    assert evidence_events[0].details["screenshot_is_unredacted_pii_risk"] is True
+
+    run_dir = tmp_path / result.run_id
+    screenshot_path = run_dir / evidence_events[0].details["screenshot_path"]
+    assert screenshot_path.read_bytes().startswith(b"\x89PNG"), "a real PNG screenshot must have been captured"
+
+    dom_snapshot_path = run_dir / evidence_events[0].details["dom_snapshot_path"]
+    assert dom_snapshot_path.exists(), "a real accessibility-tree snapshot must have been captured"
+    assert len(dom_snapshot_path.read_text()) > 0

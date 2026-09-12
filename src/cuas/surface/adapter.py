@@ -45,14 +45,22 @@ class WaitCondition(BaseModel):
 
 class Evidence(BaseModel):
     """Raw evidence captured directly from the surface. Persisting this to
-    disk under a run/step id is EvidenceStore's job (observability package,
-    Phase 7), not the adapter's."""
+    disk under a run/step id is EvidenceStore's job (observability
+    package, Phase 7), not the adapter's -- this type only carries what
+    was captured, in memory, for the caller to hand off.
+
+    `dom_snapshot` is a best-effort accessibility-tree snapshot (thin: one
+    extra call, JSON text, no separate DOM diffing/parsing machinery). It
+    is optional because not every SurfaceAdapter implementation can
+    produce one cheaply, and a missing snapshot should never block
+    capturing the rest of the evidence."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     url: str
     screenshot_png: bytes
     visible_text_excerpt: str
+    dom_snapshot: str | None = None
 
 
 class SurfaceAdapter(ABC):
