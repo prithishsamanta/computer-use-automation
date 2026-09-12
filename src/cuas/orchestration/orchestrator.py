@@ -12,44 +12,53 @@ top-level flows describe --
 
 -- composed from the pieces every earlier phase already built:
 `CapabilityService` (Phase 10) decides whether a compatible artifact
-exists; `ReplayEngine` (Phase 5/7) deterministically executes one;
-`DiscoveryEngine` (Phase 8) drives a live LLM-guided attempt when none
-does; `ArtifactBuilder` (Phase 9) turns a *successful* discovery run into
-a storable artifact; `ArtifactRepository`/`CapabilityService.register`
-persist it. This module does not reimplement any of their algorithms --
-it only decides, from each one's own structured result, what to do next
-and how to translate the outcome into one stable `RunResult` shape.
+exists; `ReplayEngine` (Phase 5/7/12) deterministically executes one, and
+can resume one already partway through; `DiscoveryEngine` (Phase 8) drives
+a live LLM-guided attempt when none does; `ArtifactBuilder` (Phase 9)
+turns a *successful* discovery run into a storable artifact;
+`ArtifactRepository`/`CapabilityService.register` persist it;
+`SessionRegistry` (Phase 12) keeps one paused run's live surface open
+across the human-handoff boundary. This module does not reimplement any
+of their algorithms -- it only decides, from each one's own structured
+result, what to do next and how to translate the outcome into one stable
+`RunResult` shape.
 
 Deliberately NOT here: replay's step loop, policy's SAFE/APPROVAL/BLOCKED
-combination logic, discovery's observe-propose-execute loop, or
-capability's compatibility/specificity resolution. Each stays exactly
-where it already lived; this module only calls into it.
+combination logic, discovery's observe-propose-execute loop, capability's
+compatibility/specificity resolution, or the human-handoff *state
+machine*'s own transition rules (those live on `InterventionStatus`/
+`ControlState` and are only ever set here, never re-derived). Each stays
+exactly where it already lived; this module only calls into it.
 
-No Celery/RabbitMQ/Kafka: `run_capability` is a single direct async call
-that runs synchronously to completion (its own await chain -- capability
-lookup, then either one replay or one discovery-then-replay pass -- is
-already fully async I/O, which is all "direct/synchronous orchestration"
-ever meant here). A caller wanting a background job queue on top of this
-is free to add one outside this module; nothing about this design
-requires it.
+No Celery/RabbitMQ/Kafka: every method here (`run_capability`,
+`claim_intervention`, `mark_human_control_complete`, `resume_run`) is a
+single direct call that runs synchronously to completion. The
+*asynchronous* part Phase 12 introduces -- real-world time passing while
+an operator is paged, looks at the queue, and eventually acts -- is
+modeled entirely by persisted state (`InterventionRequest` rows an
+operator's own client polls or is notified about some other way, outside
+this system's scope) plus one in-process `SessionRegistry` holding the
+paused browser open in the meantime; it is not a message broker, a
+background worker, or a long-running task of any kind. Nothing sits
+"running" between a pause and its eventual `resume_run` call except an
+idle Playwright browser process.
 
-**Known, explicitly-flagged limitation carried over from this phase's own
-scope, not a silent gap:** `.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md` is
-explicit that creating an `InterventionRequest` must NOT terminate the
-live browser session -- "Do not terminate the browser session when
-intervention is created... control transfer of the SAME live session."
-This module's `surface_factory` context manager closes its surface
-(`async with self._surface_factory() as surface: ...`) before an
-intervention record is even created, because Phase 11 has no session
-registry to hand a still-open surface off to across the request/response
-boundary in the first place. `InterventionRequest.session_id` is
-therefore always `None` here (see handoff/models.py's docstring). Keeping
-a live session paused and resumable is precisely what Phase 12
-("Intervention / human-handoff persistence + async resume") exists to
-add; this phase creates the correct escalation *record* (run_id,
-capability_id, tenant_id, current_step, reason, status=PENDING) through
-the real interface, deliberately deferring only the session-preservation
-mechanism itself.
+**Phase 11's explicitly-flagged limitation, now closed:** Phase 11's
+`async with self._surface_factory() as surface: ...` closed the surface
+before an `InterventionRequest` could even be created, so
+`session_id` was always `None`. Phase 12 replaces that pattern with a
+manually-managed context manager (`cm = self._surface_factory(); surface
+= await cm.__aenter__()`) that is *not* exited when a replay/discovery
+attempt escalates -- instead the still-open `(surface, cm)` pair is
+registered in `SessionRegistry` under a fresh `session_id`, control state
+`PAUSED_WAITING_FOR_HUMAN`, and that id is what `InterventionRequest.
+session_id` now actually names. The surface is only closed (`cm.
+__aexit__`) once a run reaches a genuinely terminal outcome -- see
+`_close_surface`, and the docstrings on `_run_replay`/`_run_discovery`/
+`resume_run`/`cancel_intervention` for exactly where each transition
+happens. `cuas.handoff.session`'s own module docstring explains the one
+real limitation this still carries: a live session cannot survive this
+process restarting, only a persisted `InterventionRequest` can.
 """
 
 from __future__ import annotations
@@ -70,8 +79,15 @@ from cuas.discovery import (
     DiscoveryTraceStore,
     LLMClient,
 )
-from cuas.domain import AppContext, InterventionStatus
-from cuas.handoff import InterventionRepository, InterventionRequest
+from cuas.domain import AppContext, ControlState, InterventionStatus
+from cuas.handoff import (
+    AutomationSession,
+    InterventionOwnershipError,
+    InterventionRepository,
+    InterventionRequest,
+    InterventionStateError,
+    SessionRegistry,
+)
 from cuas.observability.event_sink import EventSink, NullEventSink
 from cuas.observability.events import EventType, RunEvent
 from cuas.observability.evidence import EvidenceStore, NullEvidenceStore
@@ -85,11 +101,12 @@ from cuas.surface.adapter import SurfaceAdapter
 # shape `cuas.surface.playwright_adapter.launch_playwright_surface`
 # already has (see tests/integration/test_artifact_builder_e2e.py's
 # `async with launch_playwright_surface() as surface:`), so a real caller
-# just passes that function in unchanged. RunOrchestrator calls this once
-# per fresh surface it needs -- never more than twice in one
-# `run_capability` call (once for a plain replay or a discovery attempt;
-# a second time only for the replay that immediately follows a *newly
-# successful* discovery -- see `_materialize_capability`).
+# just passes that function in unchanged. RunOrchestrator calls this at
+# most twice in one *unescalated* `run_capability` call (once for a plain
+# replay/discovery attempt, and again only for the replay that immediately
+# follows a *newly successful* discovery); an escalation followed by
+# `resume_run` never calls it again for that run -- it reuses the surface
+# already held open in `SessionRegistry` (see module docstring).
 SurfaceFactory = Callable[[], AbstractAsyncContextManager[SurfaceAdapter]]
 
 
@@ -108,6 +125,7 @@ class RunOrchestrator:
         discovery_limits: DiscoveryLimits | None = None,
         event_sink: EventSink | None = None,
         evidence_store: EvidenceStore | None = None,
+        session_registry: SessionRegistry | None = None,
     ) -> None:
         self._capabilities = capability_service
         self._artifacts = artifact_repository
@@ -125,6 +143,13 @@ class RunOrchestrator:
         self._discovery_limits = discovery_limits
         self._event_sink = event_sink or NullEventSink()
         self._evidence_store = evidence_store or NullEvidenceStore()
+        # Defaults to a fresh, empty registry -- fine for the common case
+        # (one orchestrator instance, one process, e.g. api/main.py's
+        # composition root). A caller only needs to pass its own instance
+        # in when a test wants to inspect paused sessions directly (see
+        # tests/unit/test_intervention_lifecycle.py) or, hypothetically,
+        # share one registry across orchestrator instances.
+        self._sessions = session_registry if session_registry is not None else SessionRegistry()
 
     async def run_capability(
         self,
@@ -201,10 +226,48 @@ class RunOrchestrator:
         run_id: str,
         capability_id: str,
         discovered_new_capability: bool = False,
+        resume_session_id: str | None = None,
     ) -> RunResult:
-        async with self._surface_factory() as surface:
-            engine = ReplayEngine(surface, self._policy, event_sink=self._event_sink, evidence_store=self._evidence_store)
-            replay_result = await engine.run(artifact, inputs, context, run_id=run_id)
+        """Runs (or resumes) one replay attempt.
+
+        `resume_session_id` is `None` for a brand-new attempt (the common
+        case: `run_capability` calling this directly, or
+        `_materialize_capability`'s post-discovery verification replay) --
+        a fresh surface is acquired from `surface_factory` and, on a
+        terminal outcome, closed again before returning. When it names an
+        existing `AutomationSession` (only `resume_run` passes this), the
+        session's own already-open surface is reused instead -- `
+        surface_factory` is not called at all, satisfying .CLAUDE/04's "do
+        not terminate the browser session" / "do not create a new browser
+        session for the operator" -- and `ReplayEngine.run` is told exactly
+        where to resume via `session.resume_step_id`.
+
+        Either way, an escalating result (APPROVAL_REQUIRED/FAILED) does
+        NOT close the surface: it registers (or updates) an
+        `AutomationSession` and creates a new `InterventionRequest`
+        pointing at it, leaving the browser open for the next claim/
+        resume cycle. Every other outcome (SUCCESS/BUSINESS_OUTCOME/
+        BLOCKED) is terminal and always closes the surface.
+        """
+
+        if resume_session_id is not None:
+            session = self._sessions.get(resume_session_id)
+            surface = session.surface
+            cm: AbstractAsyncContextManager[SurfaceAdapter] | None = None
+            resume_from_step_id = session.resume_step_id
+        else:
+            cm = self._surface_factory()
+            surface = await cm.__aenter__()
+            resume_from_step_id = None
+
+        engine = ReplayEngine(surface, self._policy, event_sink=self._event_sink, evidence_store=self._evidence_store)
+        try:
+            replay_result = await engine.run(
+                artifact, inputs, context, run_id=run_id, resume_from_step_id=resume_from_step_id
+            )
+        except Exception:
+            await self._close_surface(cm, resume_session_id)
+            raise
 
         common = dict(
             run_id=run_id,
@@ -214,9 +277,11 @@ class RunOrchestrator:
         )
 
         if replay_result.status == ReplayStatus.SUCCESS:
+            await self._close_surface(cm, resume_session_id)
             return RunResult(**common, outcome=RunOutcome.SUCCESS, outputs=replay_result.outputs)
 
         if replay_result.status == ReplayStatus.BUSINESS_OUTCOME:
+            await self._close_surface(cm, resume_session_id)
             return RunResult(
                 **common, outcome=RunOutcome.BUSINESS_OUTCOME, business_outcome_code=replay_result.business_outcome_code
             )
@@ -226,38 +291,72 @@ class RunOrchestrator:
             # operator can approve past -- .CLAUDE/04: "Do not execute.
             # Log the policy decision and terminate." Nothing for a human
             # to act on, so (deliberately, see module docstring) no
-            # intervention is created for this branch; APPROVAL_REQUIRED
-            # and FAILED below are the two escalation triggers this
-            # phase's instructions actually name ("policy approval
-            # requirement / unresolved failure").
+            # intervention is created for this branch, and the surface is
+            # closed immediately -- there is nothing left to hand off.
+            await self._close_surface(cm, resume_session_id)
             return RunResult(**common, outcome=RunOutcome.BLOCKED, reason=replay_result.escalation_reason)
 
-        if replay_result.status == ReplayStatus.APPROVAL_REQUIRED:
-            intervention_id = self._create_intervention(
-                run_id=run_id,
-                capability_id=capability_id,
-                context=context,
-                reason=replay_result.escalation_reason or "operator approval required",
-                current_step=replay_result.escalation_step_id,
-            )
-            return RunResult(
-                **common, outcome=RunOutcome.APPROVAL_REQUIRED, reason=replay_result.escalation_reason, intervention_id=intervention_id
-            )
+        # APPROVAL_REQUIRED or FAILED: pause. Keep the surface open (in a
+        # new AutomationSession, or updated in place if this attempt was
+        # itself a resume that escalated again) and create a fresh
+        # InterventionRequest naming it.
+        session_id = resume_session_id or uuid.uuid4().hex
+        is_approval = replay_result.status == ReplayStatus.APPROVAL_REQUIRED
+        # FAILED with no escalation_step_id means the failure happened
+        # after every step ran (output extraction / success-condition
+        # verification) -- resume there via ReplayEngine's dedicated
+        # sentinel rather than re-running the whole artifact.
+        resume_step_id = replay_result.escalation_step_id if is_approval else (
+            replay_result.escalation_step_id or ReplayEngine.RESUME_AFTER_ALL_STEPS
+        )
 
-        # ReplayStatus.FAILED -- an unresolved hard failure.
+        if cm is not None:
+            self._sessions.register(
+                AutomationSession(
+                    session_id=session_id,
+                    run_id=run_id,
+                    capability_id=capability_id,
+                    context=context,
+                    inputs=inputs,
+                    origin="replay",
+                    surface=surface,
+                    surface_cm=cm,
+                    control_state=ControlState.PAUSED_WAITING_FOR_HUMAN,
+                    discovered_new_capability=discovered_new_capability,
+                    artifact=artifact,
+                    resume_step_id=resume_step_id,
+                )
+            )
+        else:
+            session.control_state = ControlState.PAUSED_WAITING_FOR_HUMAN
+            session.resume_step_id = resume_step_id
+            session.discovered_new_capability = discovered_new_capability
+
+        reason = replay_result.escalation_reason if is_approval else (replay_result.error_message or "replay failed")
         intervention_id = self._create_intervention(
             run_id=run_id,
             capability_id=capability_id,
             context=context,
-            reason=replay_result.error_message or "replay failed",
-            current_step=None,
+            reason=reason,
+            current_step=replay_result.escalation_step_id,
+            session_id=session_id,
         )
+
+        if is_approval:
+            return RunResult(
+                **common,
+                outcome=RunOutcome.APPROVAL_REQUIRED,
+                reason=replay_result.escalation_reason,
+                intervention_id=intervention_id,
+                session_id=session_id,
+            )
         return RunResult(
             **common,
             outcome=RunOutcome.FAILED,
             error_code=replay_result.error_code,
             error_message=replay_result.error_message,
             intervention_id=intervention_id,
+            session_id=session_id,
         )
 
     # -- no capability found: live discovery ------------------------------
@@ -270,25 +369,59 @@ class RunOrchestrator:
         context: AppContext,
         *,
         run_id: str,
+        resume_session_id: str | None = None,
     ) -> RunResult:
-        assert self._llm is not None  # caller (run_capability) already checked
-        self._emit(run_id, EventType.DISCOVERY_STARTED, details={"capability_id": capability_id})
+        """Runs (or resumes) one discovery attempt, mirroring
+        `_run_replay`'s surface-acquisition/pause/resume shape.
 
-        async with self._surface_factory() as surface:
-            engine = DiscoveryEngine(
-                surface,
-                self._policy,
-                self._llm,
-                event_sink=self._event_sink,
-                evidence_store=self._evidence_store,
-                trace_store=self._trace_store,
-            )
+        Resuming a paused *discovery* is a deliberately simpler model than
+        resuming a paused *replay*: `DiscoveryEngine` has no notion of
+        resuming an LLM conversation from a specific mid-loop point (that
+        would mean serializing and replaying model context, a much larger
+        feature this phase does not attempt). Instead, `resume_run` gives
+        the LLM a fresh `DiscoveryEngine.run()` call -- a new reasoning
+        attempt from scratch -- but on the exact same, still-open surface,
+        so whatever the operator did while in HUMAN_CONTROL (dismissed a
+        blocking dialog, navigated past a broken page, manually satisfied
+        a captcha) is reflected in what the model observes next. This is
+        an explicit simplification, not an oversight -- see
+        DECISIONS_LOG.md's Phase 12 entry.
+        """
+
+        assert self._llm is not None  # caller (run_capability/resume_run) already checked
+        self._emit(
+            run_id, EventType.DISCOVERY_STARTED, details={"capability_id": capability_id, "resumed": resume_session_id is not None}
+        )
+
+        if resume_session_id is not None:
+            session = self._sessions.get(resume_session_id)
+            surface = session.surface
+            cm: AbstractAsyncContextManager[SurfaceAdapter] | None = None
+        else:
+            cm = self._surface_factory()
+            surface = await cm.__aenter__()
+
+        engine = DiscoveryEngine(
+            surface,
+            self._policy,
+            self._llm,
+            event_sink=self._event_sink,
+            evidence_store=self._evidence_store,
+            trace_store=self._trace_store,
+        )
+        try:
             discovery_result = await engine.run(goal, context, self._discovery_limits, run_id=run_id)
+        except Exception:
+            await self._close_surface(cm, resume_session_id)
+            raise
 
         if discovery_result.status == DiscoveryStatus.SUCCESS:
-            return await self._materialize_capability(capability_id, goal, inputs, context, run_id=run_id)
+            return await self._materialize_capability(
+                capability_id, goal, inputs, context, run_id=run_id, discovery_cm=cm, discovery_session_id=resume_session_id
+            )
 
         if discovery_result.status == DiscoveryStatus.BUSINESS_OUTCOME:
+            await self._close_surface(cm, resume_session_id)
             return RunResult(
                 run_id=run_id,
                 capability_id=capability_id,
@@ -298,10 +431,35 @@ class RunOrchestrator:
 
         if discovery_result.status == DiscoveryStatus.BLOCKED:
             # Same rationale as the replay branch above: a terminal denial,
-            # not an approval an operator can grant, so no intervention.
+            # not an approval an operator can grant, so no intervention
+            # and the surface closes immediately.
+            await self._close_surface(cm, resume_session_id)
             return RunResult(
                 run_id=run_id, capability_id=capability_id, outcome=RunOutcome.BLOCKED, reason=discovery_result.escalation_reason
             )
+
+        # Every remaining terminal DiscoveryStatus (APPROVAL_REQUIRED,
+        # MALFORMED_MODEL_OUTPUT, LOOP_DETECTED, MAX_STEPS_EXCEEDED,
+        # MAX_DURATION_EXCEEDED, MAX_TOKENS_EXCEEDED, FAILED) pauses the
+        # session for a human, exactly like the replay branch.
+        session_id = resume_session_id or uuid.uuid4().hex
+        if cm is not None:
+            self._sessions.register(
+                AutomationSession(
+                    session_id=session_id,
+                    run_id=run_id,
+                    capability_id=capability_id,
+                    context=context,
+                    inputs=inputs,
+                    origin="discovery",
+                    surface=surface,
+                    surface_cm=cm,
+                    control_state=ControlState.PAUSED_WAITING_FOR_HUMAN,
+                    discovery_goal=goal,
+                )
+            )
+        else:
+            session.control_state = ControlState.PAUSED_WAITING_FOR_HUMAN
 
         if discovery_result.status == DiscoveryStatus.APPROVAL_REQUIRED:
             intervention_id = self._create_intervention(
@@ -312,6 +470,7 @@ class RunOrchestrator:
                 current_step=(
                     str(discovery_result.escalation_step_index) if discovery_result.escalation_step_index is not None else None
                 ),
+                session_id=session_id,
             )
             return RunResult(
                 run_id=run_id,
@@ -319,20 +478,16 @@ class RunOrchestrator:
                 outcome=RunOutcome.APPROVAL_REQUIRED,
                 reason=discovery_result.escalation_reason,
                 intervention_id=intervention_id,
+                session_id=session_id,
             )
 
-        # Every remaining terminal DiscoveryStatus (MALFORMED_MODEL_OUTPUT,
-        # LOOP_DETECTED, MAX_STEPS_EXCEEDED, MAX_DURATION_EXCEEDED,
-        # MAX_TOKENS_EXCEEDED, FAILED) is an unresolved failure of the
-        # discovery attempt itself -- exactly .CLAUDE/04's "the discovery
-        # model loops / becomes stuck" and "bounded safe recovery is
-        # exhausted" escalation triggers.
         intervention_id = self._create_intervention(
             run_id=run_id,
             capability_id=capability_id,
             context=context,
             reason=discovery_result.error_message or f"discovery ended with status {discovery_result.status.value}",
             current_step=str(discovery_result.steps_taken),
+            session_id=session_id,
         )
         return RunResult(
             run_id=run_id,
@@ -340,6 +495,7 @@ class RunOrchestrator:
             outcome=RunOutcome.FAILED,
             error_message=discovery_result.error_message,
             intervention_id=intervention_id,
+            session_id=session_id,
         )
 
     # -- successful discovery: build, store, register, then fulfil the request --
@@ -352,6 +508,8 @@ class RunOrchestrator:
         context: AppContext,
         *,
         run_id: str,
+        discovery_cm: AbstractAsyncContextManager[SurfaceAdapter] | None,
+        discovery_session_id: str | None,
     ) -> RunResult:
         """A successful `DiscoveryResult` alone is not enough to answer the
         original request: it proves the goal was accomplished, but neither
@@ -359,7 +517,7 @@ class RunOrchestrator:
         outputs (see discovery/models.py -- `read_value` is a raw string,
         and naming/typing an output is `ArtifactBuilder`'s job, not
         discovery's). Rather than duplicate that output-typing logic here
-        (exactly what this phase's instructions say not to do), this
+        (exactly what earlier phases' instructions say not to do), this
         method builds and stores the real artifact, registers the
         capability so every *future* request skips discovery entirely,
         and then fulfils *this* request the same way a future one would:
@@ -370,17 +528,31 @@ class RunOrchestrator:
         every subsequent one are produced by the exact same, already-
         proven replay code path, with no separate output-extraction logic
         to keep in sync.
+
+        `discovery_cm`/`discovery_session_id` name whatever surface
+        discovery itself just finished with (a fresh one, or a resumed
+        `AutomationSession`'s). Once the discovery trace is safely loaded
+        from disk, that surface is done being useful -- everything from
+        here on is artifact construction plus a *separate* verification
+        replay against its own fresh surface -- so it is always closed
+        before this method returns, on every path (including the two
+        failure paths below), never left paused for an operator: neither
+        of those failures is something a human can fix by touching the
+        browser (they're about the trace file / artifact schema, not
+        about the live page).
         """
 
         try:
             trace = self._trace_store.load(run_id)
         except FileNotFoundError as exc:
+            await self._close_surface(discovery_cm, discovery_session_id)
             intervention_id = self._create_intervention(
                 run_id=run_id,
                 capability_id=capability_id,
                 context=context,
                 reason=f"discovery succeeded but its trace could not be loaded for artifact construction: {exc}",
                 current_step=None,
+                session_id=None,
             )
             return RunResult(
                 run_id=run_id, capability_id=capability_id, outcome=RunOutcome.FAILED, error_message=str(exc), intervention_id=intervention_id
@@ -391,16 +563,20 @@ class RunOrchestrator:
         try:
             artifact = self._artifact_builder.build(trace, goal, context, capability_id=capability_id, version=version)
         except ArtifactBuildError as exc:
+            await self._close_surface(discovery_cm, discovery_session_id)
             intervention_id = self._create_intervention(
                 run_id=run_id,
                 capability_id=capability_id,
                 context=context,
                 reason=f"discovery succeeded but could not be turned into a reusable artifact: {exc}",
                 current_step=None,
+                session_id=None,
             )
             return RunResult(
                 run_id=run_id, capability_id=capability_id, outcome=RunOutcome.FAILED, error_message=str(exc), intervention_id=intervention_id
             )
+
+        await self._close_surface(discovery_cm, discovery_session_id)
 
         self._artifacts.save(artifact)
         # Registered scoped to exactly this tenant (not the "base" sentinel
@@ -448,6 +624,213 @@ class RunOrchestrator:
         major, minor, patch = (int(part) for part in existing[-1].split("."))
         return f"{major}.{minor}.{patch + 1}"
 
+    # -- surface lifecycle ---------------------------------------------------
+
+    async def _close_surface(
+        self, cm: AbstractAsyncContextManager[SurfaceAdapter] | None, session_id: str | None
+    ) -> None:
+        """The single place a surface's teardown actually happens, called
+        from every terminal branch of `_run_replay`/`_run_discovery`/
+        `_materialize_capability`, plus `cancel_intervention`.
+
+        Exactly one of `cm`/`session_id` is meaningful for a given call:
+        `cm` when this attempt acquired a brand-new surface itself (not a
+        resume), `session_id` when it reused one already sitting in
+        `SessionRegistry` (a resume) -- in which case the session is
+        removed from the registry here, since a terminal outcome means
+        there is nothing left to resume.
+        """
+
+        if cm is not None:
+            await cm.__aexit__(None, None, None)
+        elif session_id is not None:
+            session = self._sessions.discard(session_id)
+            await session.surface_cm.__aexit__(None, None, None)
+
+    # -- human handoff lifecycle (Phase 12) ----------------------------------
+
+    def claim_intervention(self, intervention_id: str, *, operator_id: str) -> InterventionRequest:
+        """PENDING -> CLAIMED, and (if a live session is attached)
+        PAUSED_WAITING_FOR_HUMAN -> HUMAN_CONTROL. .CLAUDE/04: "operator
+        claims request -> operator takes control of SAME live session."
+        This method only records that transition -- Phase 12 does not
+        wire up an actual remote-control surface (VNC/CDP passthrough) for
+        the operator to literally drive the browser; that is Phase 13's
+        "headed browser + Xvfb + noVNC" job. What matters here is that the
+        browser genuinely still exists, untouched, for whenever that
+        wiring is added.
+
+        Raises `InterventionStateError` on a double-claim (or any claim
+        attempt against a non-PENDING intervention) rather than silently
+        overwriting `claimed_by` -- exactly the "invalid/double claim"
+        case the phase asks to be handled, not ignored.
+        """
+
+        intervention = self._interventions.get(intervention_id)
+        if intervention.status != InterventionStatus.PENDING:
+            raise InterventionStateError(
+                f"intervention {intervention_id!r} cannot be claimed: status is "
+                f"{intervention.status.value!r}, not 'pending' (already claimed or resolved)"
+            )
+
+        if intervention.session_id is not None:
+            session = self._sessions.get(intervention.session_id)
+            session.control_state = ControlState.HUMAN_CONTROL
+
+        updated = intervention.model_copy(update={"status": InterventionStatus.CLAIMED, "claimed_by": operator_id})
+        self._interventions.save(updated)
+        self._emit(
+            intervention.run_id,
+            EventType.INTERVENTION_CLAIMED,
+            step_id=intervention.current_step,
+            details={"intervention_id": intervention_id, "claimed_by": operator_id},
+        )
+        return updated
+
+    def mark_human_control_complete(self, intervention_id: str, *, operator_id: str) -> InterventionRequest:
+        """CLAIMED -> RESOLVED, and (if a live session is attached)
+        HUMAN_CONTROL -> RESUME_REQUESTED. .CLAUDE/04: "operator resolves
+        issue -> operator hands control back." This marks the human's own
+        part of the handoff done and the session as ready for
+        `resume_run` to actually continue automation -- it does not
+        itself resume anything, matching the phase's own split between
+        "mark human control complete / request resume" and "resume run"
+        as separate actions/endpoints.
+
+        `operator_id` must match whoever claimed it
+        (`InterventionOwnershipError` otherwise) -- the explicit, simple
+        stand-in this phase uses instead of real IAM (see
+        `cuas.handoff.errors.InterventionOwnershipError`'s docstring).
+        """
+
+        intervention = self._interventions.get(intervention_id)
+        if intervention.status != InterventionStatus.CLAIMED:
+            raise InterventionStateError(
+                f"intervention {intervention_id!r} is not currently claimed (status={intervention.status.value!r})"
+            )
+        if intervention.claimed_by != operator_id:
+            raise InterventionOwnershipError(
+                f"intervention {intervention_id!r} was claimed by {intervention.claimed_by!r}, not {operator_id!r}"
+            )
+
+        if intervention.session_id is not None:
+            session = self._sessions.get(intervention.session_id)
+            session.control_state = ControlState.RESUME_REQUESTED
+
+        updated = intervention.model_copy(
+            update={"status": InterventionStatus.RESOLVED, "resolved_at": datetime.now(timezone.utc)}
+        )
+        self._interventions.save(updated)
+        self._emit(
+            intervention.run_id,
+            EventType.HUMAN_CONTROL_COMPLETED,
+            step_id=intervention.current_step,
+            details={"intervention_id": intervention_id, "operator_id": operator_id},
+        )
+        return updated
+
+    async def resume_run(self, intervention_id: str) -> RunResult:
+        """RESUME_REQUESTED -> RUNNING_AUTOMATION, and actually continues
+        the paused run on its original session/surface -- `.CLAUDE/04`'s
+        "automation resumes" step. Requires
+        `mark_human_control_complete` to have run first (an intervention
+        must be RESOLVED with its session in RESUME_REQUESTED); calling
+        this any earlier raises `InterventionStateError` rather than
+        resuming a session a human hasn't actually finished with.
+
+        Dispatches on `session.origin`: a paused replay resumes via
+        `_run_replay(..., resume_session_id=...)` (continuing
+        `ReplayEngine` from `session.resume_step_id`); a paused discovery
+        resumes via `_run_discovery(..., resume_session_id=...)` (a fresh
+        `DiscoveryEngine` attempt on the same surface -- see that method's
+        docstring for why that's the right level of resume fidelity for
+        discovery specifically). Either path may escalate again (a second
+        APPROVAL_REQUIRED/FAILED) -- in which case the *same* `run_id` and
+        `session_id` carry forward into a brand-new `InterventionRequest`,
+        exactly the "preserve the original run_id across pause/handoff/
+        resume" requirement, for as many pause/resume cycles as it takes.
+        """
+
+        intervention = self._interventions.get(intervention_id)
+        if intervention.status != InterventionStatus.RESOLVED:
+            raise InterventionStateError(
+                f"intervention {intervention_id!r} is not ready to resume (status={intervention.status.value!r}); "
+                "call mark_human_control_complete first"
+            )
+        if intervention.session_id is None:
+            raise InterventionStateError(f"intervention {intervention_id!r} has no live session to resume")
+
+        session = self._sessions.get(intervention.session_id)
+        if session.control_state != ControlState.RESUME_REQUESTED:
+            raise InterventionStateError(
+                f"session {intervention.session_id!r} is not ready to resume "
+                f"(control_state={session.control_state.value!r}); call mark_human_control_complete first"
+            )
+
+        session.control_state = ControlState.RUNNING_AUTOMATION
+        self._emit(
+            session.run_id,
+            EventType.RUN_RESUMED,
+            details={"intervention_id": intervention_id, "session_id": session.session_id, "origin": session.origin},
+        )
+
+        if session.origin == "replay":
+            assert session.artifact is not None
+            result = await self._run_replay(
+                session.artifact,
+                session.inputs,
+                session.context,
+                run_id=session.run_id,
+                capability_id=session.capability_id,
+                discovered_new_capability=session.discovered_new_capability,
+                resume_session_id=session.session_id,
+            )
+        else:
+            assert session.discovery_goal is not None
+            result = await self._run_discovery(
+                session.capability_id,
+                session.discovery_goal,
+                session.inputs,
+                session.context,
+                run_id=session.run_id,
+                resume_session_id=session.session_id,
+            )
+
+        return self._finish(result)
+
+    async def cancel_intervention(self, intervention_id: str, *, operator_id: str) -> InterventionRequest:
+        """An operator's explicit "give up on this run" -- not named as a
+        required endpoint by the phase instructions, but `InterventionStatus
+        .CANCELLED` already existed in the domain vocabulary (Phase 4/11
+        scaffolding) with nothing that ever set it. This is what does:
+        PENDING or CLAIMED -> CANCELLED, and unconditionally closes
+        whatever live session was still attached (there is no further
+        resume for a cancelled intervention -- unlike the RESOLVED path,
+        cancellation itself performs the session cleanup, rather than
+        waiting for a `resume_run` call that will never come).
+        """
+
+        intervention = self._interventions.get(intervention_id)
+        if intervention.status not in (InterventionStatus.PENDING, InterventionStatus.CLAIMED):
+            raise InterventionStateError(
+                f"intervention {intervention_id!r} cannot be cancelled (status={intervention.status.value!r})"
+            )
+
+        if intervention.session_id is not None and intervention.session_id in self._sessions:
+            await self._close_surface(None, intervention.session_id)
+
+        updated = intervention.model_copy(
+            update={"status": InterventionStatus.CANCELLED, "resolved_at": datetime.now(timezone.utc)}
+        )
+        self._interventions.save(updated)
+        self._emit(
+            intervention.run_id,
+            EventType.INTERVENTION_CANCELLED,
+            step_id=intervention.current_step,
+            details={"intervention_id": intervention_id, "operator_id": operator_id},
+        )
+        return updated
+
     # -- intervention creation ---------------------------------------------
 
     def _create_intervention(
@@ -458,6 +841,7 @@ class RunOrchestrator:
         context: AppContext,
         reason: str,
         current_step: str | None,
+        session_id: str | None,
     ) -> str:
         intervention_id = uuid.uuid4().hex
         request = InterventionRequest(
@@ -467,6 +851,7 @@ class RunOrchestrator:
             tenant_id=context.tenant_id,
             current_step=current_step,
             reason=reason,
+            session_id=session_id,
             status=InterventionStatus.PENDING,
             created_at=datetime.now(timezone.utc),
         )
@@ -476,7 +861,7 @@ class RunOrchestrator:
             EventType.INTERVENTION_REQUESTED,
             step_id=current_step,
             status="escalation",
-            details={"intervention_id": intervention_id, "reason": reason},
+            details={"intervention_id": intervention_id, "reason": reason, "session_id": session_id},
         )
         return intervention_id
 
@@ -498,6 +883,7 @@ class RunOrchestrator:
                 "outcome": result.outcome.value,
                 "capability_id": result.capability_id,
                 "discovered_new_capability": result.discovered_new_capability,
+                "session_id": result.session_id,
             },
         )
         return result

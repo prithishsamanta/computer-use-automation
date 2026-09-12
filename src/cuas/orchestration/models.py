@@ -39,7 +39,16 @@ class RunResult(BaseModel):
     propagated through capability resolution, discovery, replay, and any
     intervention created along the way (.CLAUDE/06_ERRORS_AND_OBSERVABILITY.md,
     "Traceability": every question a reviewer might ask should be
-    answerable from this one id's event stream)."""
+    answerable from this one id's event stream) -- and, from Phase 12 on,
+    across a pause/handoff/resume cycle too: a resumed run's `RunResult`
+    carries the exact same `run_id` it started with.
+
+    `session_id` (Phase 12) is set alongside `intervention_id` whenever an
+    APPROVAL_REQUIRED/FAILED outcome left a live automation session open
+    for an operator to take over (see `cuas.handoff.session`); it is
+    `None` for every outcome that doesn't pause a session (SUCCESS,
+    BUSINESS_OUTCOME, BLOCKED, DISCOVERY_REQUIRED, AMBIGUOUS_CAPABILITY).
+    """
 
     run_id: str
     capability_id: str
@@ -50,6 +59,7 @@ class RunResult(BaseModel):
     error_message: str | None = None
     reason: str | None = None
     intervention_id: str | None = None
+    session_id: str | None = None
     artifact_version: str | None = None
     discovered_new_capability: bool = Field(
         default=False,

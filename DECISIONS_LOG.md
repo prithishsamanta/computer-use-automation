@@ -193,7 +193,7 @@ Default branch: `main`.
 9. ✅ Artifact builder (discovery run → cleaned, typed artifact; see Phase Log).
 10. ✅ Capability service (context/version/tenant resolution at call time; see Phase Log).
 11. ✅ Run orchestrator + API (RunOrchestrator control-flow layer + thin FastAPI /runs route; see Phase Log).
-12. ⬜ Intervention / human-handoff persistence + async resume.
+12. ✅ Intervention / human-handoff persistence + async resume (`SessionRegistry` keeps the live surface open across escalation; see Phase Log).
 13. ⬜ Full Docker setup for handoff: Xvfb + noVNC inside the automation
     container.
 14. ⬜ Scenario capture / demo recordings.
@@ -1011,3 +1011,170 @@ Default branch: `main`.
   not live_llm`) -- zero regressions from Phase 10's 114. No
   cloud-sandbox round-trip needed for this phase: `test_run_orchestrator
   .py` and `test_api_runs.py` are both pure unit tests against fakes.
+
+### Phase 12 — Persistent human handoff + live-session ownership/resume
+
+- **Closes Phase 11's explicitly-flagged gap.** Phase 11's `async with
+  self._surface_factory() as surface: ...` closed the browser before an
+  `InterventionRequest` could even be created, so `session_id` was always
+  `None` and there was nothing for an operator to take control of.
+  `RunOrchestrator` now manually acquires the surface's async context
+  manager (`cm = self._surface_factory(); surface = await
+  cm.__aenter__()`) instead of using `async with`, and simply does not
+  call `cm.__aexit__` when a replay/discovery attempt escalates -- the
+  still-open `(surface, cm)` pair is registered in a new `SessionRegistry`
+  under a fresh `session_id` instead. The browser is only closed, from one
+  centralized `_close_surface` helper, once a run reaches a genuinely
+  terminal outcome (`SUCCESS`, `BUSINESS_OUTCOME`, `BLOCKED`, or an
+  operator explicitly cancels). Every existing Phase 11 call site and test
+  is unaffected -- `session_registry` is an optional constructor
+  parameter defaulting to a fresh, empty registry.
+- **New `cuas.handoff.session` module (`AutomationSession`,
+  `SessionRegistry`) is a deliberate, documented exception to this
+  codebase's "one ABC + one real implementation" rule** (every other seam
+  -- `ArtifactRepository`, `CapabilityRepository`, `InterventionRepository`,
+  `PolicyEngine`, `LLMClient`, `SurfaceAdapter` -- follows it). An
+  `AutomationSession` holds a live, in-process Python object (an open
+  Playwright browser/page reachable only through the exact `SurfaceAdapter`
+  instance wrapping it) that cannot be serialized, handed to another
+  process, or meaningfully reconstructed from an "alternative backend" --
+  there is no file-backed or database-backed equivalent of "a running
+  browser." An ABC here would gesture at a swappability that doesn't
+  exist, so `SessionRegistry` is a single plain class. Its unavoidable,
+  explicitly-documented consequence: a live session cannot survive this
+  process restarting. If the API process restarts while an intervention is
+  `PENDING`, the persisted `InterventionRequest` (below) survives and
+  still shows up in an operator's queue, but the browser its `session_id`
+  named does not -- `resume_run` then raises `SessionNotFoundError` rather
+  than silently fabricating a new session. Surviving a process restart
+  would need a genuinely different mechanism (e.g. a long-running,
+  out-of-process browser server the API reconnects to over CDP) --
+  squarely Phase 13+ territory, not something this phase's registry
+  pretends to solve.
+- **`ReplayEngine.run(..., resume_from_step_id=...)`** (new optional
+  parameter, `None` by default -- every existing call site behaves
+  byte-for-byte as before). Given a step id, `run()` skips every step
+  *before* it (already executed against this exact, still-open surface --
+  re-running them would repeat real-world actions, e.g. re-submitting a
+  form) and treats that step's own policy check as already satisfied
+  (either a human just explicitly approved it, or policy already returned
+  `ALLOW` for it the first time -- policy decisions are a pure function of
+  `(step, context)`, so re-evaluating could only repeat the same
+  decision). Every step *after* the resumed one still gets a full, real
+  policy check. A dedicated sentinel, `ReplayEngine.RESUME_AFTER_ALL_STEPS`,
+  skips the step loop entirely and goes straight to output extraction --
+  for the case where the original attempt executed every step but failed
+  during output extraction or success-condition verification (no step id
+  to resume at). **Explicitly-flagged simplification:** resuming a step
+  that failed mid-action re-runs the *entire* step (its action, then its
+  checkpoint) rather than the exact sub-phase that failed. This is safe
+  for this system's actions (fill/click/navigate/read all idempotent
+  enough to repeat once) and keeps the resume mechanism to one parameter
+  instead of a second, finer-grained "resume phase" concept.
+- **Discovery-path resume is deliberately simpler than replay-path
+  resume.** `DiscoveryEngine` has no notion of resuming an LLM
+  conversation from a specific mid-loop point -- that would mean
+  serializing and replaying model context, a much larger feature this
+  phase does not attempt. Instead, resuming a paused discovery gives the
+  LLM a fresh `DiscoveryEngine.run()` call (a new reasoning attempt from
+  scratch) on the exact same, still-open surface, so whatever the operator
+  did while in `HUMAN_CONTROL` (dismissed a blocking dialog, navigated
+  past a broken page, manually satisfied a captcha) is reflected in what
+  the model observes next. An explicit simplification, not an oversight.
+- **`FileInterventionRepository`** (new, alongside the Phase 11
+  `InMemoryInterventionRepository`, which stays for fast unit tests):
+  plain JSON files on disk, one per intervention id, using the same
+  "small, mutable record expected to change in place" overwrite-on-save
+  idiom `FileCapabilityRepository` already established -- status moves
+  `PENDING -> CLAIMED -> RESOLVED/CANCELLED` over the record's life, and
+  each transition is a `save()` that overwrites the same file. Wired into
+  `api/main.py`'s composition root as the real path, per the phase
+  instruction ("Add a file-backed or similarly simple persistent
+  InterventionRepository for the real path").
+- **New `cuas.handoff.errors` module** (`HandoffError` base,
+  `InterventionStateError`, `InterventionOwnershipError`,
+  `SessionNotFoundError`) -- deliberately separate from
+  `cuas.domain.errors.AutomationError` and its subclasses, which model
+  "the automation itself hit a hard failure while driving a surface."
+  These model a different kind of problem: a caller (an operator, the API
+  layer) asking `RunOrchestrator` to do something the current
+  intervention/session state does not allow (double-claiming, resuming
+  before human control is marked complete, an ownership mismatch). Keeping
+  them a separate hierarchy lets the API layer map each to a distinct,
+  meaningful HTTP status (409 for a state conflict) without conflating
+  them with automation failures.
+- **`RunOrchestrator`'s new handoff-lifecycle methods** implement
+  `.CLAUDE/04`'s control state machine directly:
+  `claim_intervention(intervention_id, operator_id)` -- `PENDING ->
+  CLAIMED`, and (if a live session is attached) `PAUSED_WAITING_FOR_HUMAN
+  -> HUMAN_CONTROL`; raises `InterventionStateError` on a double-claim
+  rather than silently overwriting `claimed_by`.
+  `mark_human_control_complete(intervention_id, operator_id)` -- `CLAIMED
+  -> RESOLVED`, and `HUMAN_CONTROL -> RESUME_REQUESTED`; requires
+  `operator_id` to match whoever claimed it (`InterventionOwnershipError`
+  otherwise) -- the explicit, simple stand-in this phase uses instead of
+  real IAM, exactly as instructed ("Keep authorization assumptions
+  explicit rather than pretending to implement production IAM").
+  `resume_run(intervention_id)` -- requires the intervention to be
+  `RESOLVED` with its session in `RESUME_REQUESTED` (raises
+  `InterventionStateError` otherwise), then dispatches on
+  `session.origin` to `_run_replay`/`_run_discovery` with
+  `resume_session_id` set, reusing `session.surface` and never calling
+  `surface_factory` again -- verified structurally in every lifecycle test
+  via `sequential_surface_factory`'s own `assert remaining` guard.
+  `cancel_intervention(intervention_id, operator_id)` -- not named as a
+  required endpoint by the phase instructions, but `InterventionStatus
+  .CANCELLED` already existed in the domain vocabulary (Phase 4/11
+  scaffolding) with nothing that ever set it; this closes that gap and
+  unconditionally cleans up whatever live session was still attached. The
+  original `run_id` is preserved across every pause/claim/complete/resume
+  cycle, including a second escalation on resume, exactly as instructed.
+- **New API endpoints** on the existing thin FastAPI layer: `GET
+  /interventions` (defaults to the pending queue; `?pending_only=false`
+  for full history), `GET /interventions/{id}`, `POST
+  /interventions/{id}/claim`, `POST /interventions/{id}/complete`, `POST
+  /interventions/{id}/resume`, `POST /interventions/{id}/cancel`. Each
+  maps `KeyError -> 404` and `HandoffError -> 409`. `RunResponse` and the
+  new `InterventionResponse` gained a `session_id` field so an operator
+  client can tell whether a live browser is genuinely still waiting.
+- **New `EventType` members** (`intervention_claimed`,
+  `human_control_completed`, `intervention_cancelled`, `run_resumed`)
+  cover the rest of `.CLAUDE/04`'s control state machine in the structured
+  event stream, so the full pause -> claim -> human control ->
+  resume-requested -> resumed lifecycle of one intervention is
+  reconstructable from the event stream alone, the same "Traceability" bar
+  Phase 7 set.
+- **Tests** (28 new, all pure unit tests against `FakeSurfaceAdapter`/
+  `FakeLLMClient` -- no browser, no live LLM, no cloud-sandbox round-trip
+  needed): `tests/unit/test_replay_engine_resume.py` (4 tests) isolates
+  `ReplayEngine.resume_from_step_id`/`RESUME_AFTER_ALL_STEPS` mechanics
+  directly. `tests/unit/test_intervention_lifecycle.py` (13 tests) is the
+  main orchestrator-level suite: escalation retains the same live session
+  (`TestEscalationRetainsTheSession`, including the discovery path in
+  `TestDiscoveryEscalationSession`); intervention persisted with a
+  non-null `session_id`; claim transitions and double-claim/unknown-id
+  rejection (`TestClaim`); human-control-complete transitions, rejected
+  before claim, and rejected for the wrong operator
+  (`TestHumanControlComplete`); resume rejected before human control is
+  complete, resume continues the same `run_id` on the same session and
+  cleans it up on a terminal outcome, and a full cycle against the real
+  `FileInterventionRepository` (`TestResume`); cancel marks `CANCELLED`
+  and closes the session (`TestCancel`). `tests/unit
+  /test_intervention_repository.py` (7 tests) covers
+  `FileInterventionRepository` storage mechanics (round-trip,
+  overwrite-on-save, pending/all listing, unknown id, corrupt file) the
+  same way `test_capability_repository.py` covers its file-backed
+  counterpart. `tests/unit/test_api_interventions.py` (5 thin smoke
+  tests) proves the HTTP plumbing for the endpoints above without a
+  wiring bug, restricted to the empty-queue/404 paths that don't need
+  Playwright or an LLM -- the same scope `test_api_runs.py` chose for
+  `/runs`.
+- **Not built this phase, by explicit instruction:** no noVNC/remote-control
+  wiring for an operator to literally *touch* the paused browser --
+  `claim_intervention` only records the state transition; the browser
+  genuinely still exists, untouched, for whenever Phase 13's "headed
+  browser + Xvfb + noVNC Docker path" adds that wiring.
+- On-device unit suite: 158 passed, 13 deselected (`not integration and
+  not live_llm`) -- zero regressions from Phase 11's 130 (130 + 28 new =
+  158). No cloud-sandbox round-trip needed for this phase: every new test
+  is a pure unit test against fakes.

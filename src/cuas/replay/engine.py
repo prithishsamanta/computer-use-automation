@@ -7,9 +7,8 @@ known business outcome before giving up and attempting recovery before
 declaring a hard failure. After every step has run: extract typed outputs,
 verify the success condition. Every exit is a structured ReplayResult, not
 an improvised decision -- unresolved/unsafe states surface as FAILED,
-APPROVAL_REQUIRED, or BLOCKED, and it is the caller's (eventually
-RunOrchestrator's, Phase 11) job to act on that, e.g. by opening a real
-InterventionRequest (Phase 12).
+APPROVAL_REQUIRED, or BLOCKED, and it is the caller's (RunOrchestrator's)
+job to act on that, e.g. by opening a real InterventionRequest.
 
 Phase 7 adds structured observability on top of that unchanged algorithm:
 every run gets a run_id, and every event in
@@ -19,6 +18,44 @@ through an injected EvidenceStore on the FAILED path specifically. Both
 default to no-op implementations, so a caller that doesn't wire either one
 up (every Phase 5/6 test, unchanged) gets byte-for-byte the same replay
 behavior as before -- observability is additive, never a precondition.
+
+Phase 12 adds one more optional parameter, `resume_from_step_id`, so
+`RunOrchestrator` can continue a *paused* run on the exact same live
+surface after a human operator has resolved whatever caused an
+APPROVAL_REQUIRED/FAILED escalation (.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md's
+"operator resolves issue -> operator hands control back -> automation
+resumes"). This is deliberately a small addition, not a rewrite:
+
+- Left `None` (every existing call site, unchanged), `run()` behaves
+  exactly as before -- iterates every step from the beginning.
+- Given a step id, `run()` skips every step *before* it (those already
+  executed successfully against this exact surface in the original
+  attempt -- the browser is not being replaced, so re-running them would
+  mean literally repeating already-completed real-world actions, e.g.
+  re-submitting a form) and retries starting at that step, treating its
+  policy check as already satisfied: either a human just explicitly
+  approved this exact step (the APPROVAL_REQUIRED case), or policy had
+  already returned ALLOW for it the first time and nothing about a
+  step's policy decision is stateful/time-varying in this system (the
+  FAILED-at-this-step case) -- so re-evaluating would only ever repeat
+  the same decision. Every step *after* the resumed one still gets a
+  full, real policy check, exactly as in a fresh run.
+- Given the sentinel `ReplayEngine.RESUME_AFTER_ALL_STEPS`, `run()` skips
+  the step loop entirely and goes straight to output extraction --
+  for the one case where the original attempt executed every step but
+  failed during output extraction or success-condition verification
+  (`escalation_step_id` is `None` in that ReplayResult, since there is no
+  step to name).
+
+One explicitly-flagged simplification (see also DECISIONS_LOG.md's Phase
+12 entry): resuming a step that failed mid-action re-runs the *entire*
+step (policy-skip, then action execution, then its checkpoint, if any)
+rather than resuming from the exact sub-phase that failed (e.g. an action
+that already succeeded but whose checkpoint failed). This is safe for
+this system's actions (fill/click/navigate/read are all idempotent enough
+to repeat once) and keeps the resume mechanism to one parameter instead
+of a second, finer-grained "resume phase" concept; a production system
+with genuinely non-idempotent actions would want that finer granularity.
 """
 
 from __future__ import annotations
@@ -26,7 +63,7 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -80,6 +117,14 @@ class ReplayResult(BaseModel):
 
 
 class ReplayEngine:
+    # Sentinel for `run(resume_from_step_id=...)`: "every step already
+    # executed; resume directly at output extraction." Not a real step
+    # id (artifact Step ids are caller-chosen strings -- this is
+    # deliberately shaped so it could never collide with one), and never
+    # persisted anywhere outside one RunOrchestrator session's in-memory
+    # bookkeeping (see cuas.handoff.session.AutomationSession).
+    RESUME_AFTER_ALL_STEPS: ClassVar[str] = "__cuas_resume_after_all_steps__"
+
     def __init__(
         self,
         surface: SurfaceAdapter,
@@ -102,6 +147,7 @@ class ReplayEngine:
         context: AppContext,
         *,
         run_id: str | None = None,
+        resume_from_step_id: str | None = None,
     ) -> ReplayResult:
         """Caller contract: `artifact` is already schema-valid (pydantic
         guarantees that by construction; ArtifactRepository.load raises
@@ -112,10 +158,14 @@ class ReplayEngine:
         nothing upstream has checked them yet.
 
         `run_id` is normally left for this call to generate (a fresh uuid4
-        per invocation); a caller that already has one -- e.g. a future
+        per invocation); a caller that already has one -- e.g. a
         RunOrchestrator correlating replay with its own orchestration-level
-        events -- can pass it in instead so every component logs under the
-        same id.
+        events, or resuming a paused run under its original id -- can pass
+        it in instead so every component logs under the same id.
+
+        `resume_from_step_id`: see this module's docstring. `None` (the
+        default) is a full run from the first step, byte-for-byte the
+        same behavior as before this parameter existed.
         """
 
         run_id = run_id or uuid.uuid4().hex
@@ -127,6 +177,7 @@ class ReplayEngine:
                 "capability_id": artifact.capability_id,
                 "version": artifact.version,
                 "tenant_id": context.tenant_id,
+                "resumed": resume_from_step_id is not None,
                 # Sensitive inputs (e.g. a member ID) must never land in a
                 # log line -- see observability/redaction.py.
                 "inputs": redact_inputs(artifact, inputs),
@@ -143,7 +194,21 @@ class ReplayEngine:
 
         log: list[StepLogEntry] = []
 
-        for step in artifact.steps:
+        steps: list[Step] = artifact.steps
+        skip_policy_for_step_id: str | None = None
+        if resume_from_step_id == self.RESUME_AFTER_ALL_STEPS:
+            steps = []
+        elif resume_from_step_id is not None:
+            matches = [i for i, s in enumerate(steps) if s.id == resume_from_step_id]
+            if not matches:
+                raise ValueError(
+                    f"resume_from_step_id {resume_from_step_id!r} does not match any step of "
+                    f"artifact {artifact.capability_id!r} version {artifact.version!r}"
+                )
+            steps = steps[matches[0] :]
+            skip_policy_for_step_id = resume_from_step_id
+
+        for step in steps:
             self._emit(
                 run_id,
                 EventType.STEP_STARTED,
@@ -151,35 +216,54 @@ class ReplayEngine:
                 details={"action_type": step.action_type.value, "intent": step.intent},
             )
 
-            decision = self._policy.evaluate(step, context)
-            log.append(StepLogEntry(step_id=step.id, event="policy_check", detail=decision.value))
-            self._emit(
-                run_id,
-                EventType.POLICY_CHECKED,
-                step_id=step.id,
-                details={"decision": decision.value, "intent": step.intent},
-            )
-
-            if decision == PolicyDecision.DENY:
-                self._emit(run_id, EventType.RUN_COMPLETED, status="blocked", details={"status": "blocked"})
-                return ReplayResult(
-                    run_id=run_id,
-                    status=ReplayStatus.BLOCKED,
-                    step_log=log,
-                    escalation_step_id=step.id,
-                    escalation_reason=f"policy denied step {step.id!r} (intent={step.intent!r})",
-                )
-            if decision == PolicyDecision.REQUIRE_APPROVAL:
+            if step.id == skip_policy_for_step_id:
+                # Either a human just explicitly approved this exact step
+                # (resuming after APPROVAL_REQUIRED), or policy already
+                # returned ALLOW for it the first time (resuming after a
+                # FAILED execution/checkpoint at this step) -- policy
+                # decisions here are pure functions of (step, context), so
+                # re-evaluating could only repeat a decision already made.
+                # See module docstring.
+                log.append(StepLogEntry(step_id=step.id, event="policy_check", detail="skipped_on_resume"))
                 self._emit(
-                    run_id, EventType.RUN_COMPLETED, status="approval_required", details={"status": "approval_required"}
+                    run_id,
+                    EventType.POLICY_CHECKED,
+                    step_id=step.id,
+                    details={"decision": "skipped_on_resume", "intent": step.intent},
                 )
-                return ReplayResult(
-                    run_id=run_id,
-                    status=ReplayStatus.APPROVAL_REQUIRED,
-                    step_log=log,
-                    escalation_step_id=step.id,
-                    escalation_reason=f"step {step.id!r} (intent={step.intent!r}) requires operator approval",
+            else:
+                decision = self._policy.evaluate(step, context)
+                log.append(StepLogEntry(step_id=step.id, event="policy_check", detail=decision.value))
+                self._emit(
+                    run_id,
+                    EventType.POLICY_CHECKED,
+                    step_id=step.id,
+                    details={"decision": decision.value, "intent": step.intent},
                 )
+
+                if decision == PolicyDecision.DENY:
+                    self._emit(run_id, EventType.RUN_COMPLETED, status="blocked", details={"status": "blocked"})
+                    return ReplayResult(
+                        run_id=run_id,
+                        status=ReplayStatus.BLOCKED,
+                        step_log=log,
+                        escalation_step_id=step.id,
+                        escalation_reason=f"policy denied step {step.id!r} (intent={step.intent!r})",
+                    )
+                if decision == PolicyDecision.REQUIRE_APPROVAL:
+                    self._emit(
+                        run_id,
+                        EventType.RUN_COMPLETED,
+                        status="approval_required",
+                        details={"status": "approval_required"},
+                    )
+                    return ReplayResult(
+                        run_id=run_id,
+                        status=ReplayStatus.APPROVAL_REQUIRED,
+                        step_log=log,
+                        escalation_step_id=step.id,
+                        escalation_reason=f"step {step.id!r} (intent={step.intent!r}) requires operator approval",
+                    )
 
             try:
                 await self._execute_action(artifact, step, inputs, log, run_id=run_id)

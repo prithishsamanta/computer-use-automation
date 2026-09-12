@@ -48,6 +48,18 @@ class EventType(str, Enum):
     DISCOVERY_REQUIRED = "discovery_required"
     DISCOVERY_STARTED = "discovery_started"
     INTERVENTION_REQUESTED = "intervention_requested"
+    # Phase 12 (persistent handoff + session resume) additions --
+    # component="run_orchestrator". Cover the rest of .CLAUDE/04's control
+    # state machine (PAUSED_WAITING_FOR_HUMAN is INTERVENTION_REQUESTED
+    # above; these three are HUMAN_CONTROL, RESUME_REQUESTED, and back to
+    # RUNNING_AUTOMATION) so the full
+    # pause -> claim -> human control -> resume-requested -> resumed
+    # lifecycle of one intervention is reconstructable from the event
+    # stream alone, the same "Traceability" bar Phase 7 set.
+    INTERVENTION_CLAIMED = "intervention_claimed"
+    HUMAN_CONTROL_COMPLETED = "human_control_completed"
+    INTERVENTION_CANCELLED = "intervention_cancelled"
+    RUN_RESUMED = "run_resumed"
 
 
 class RunEvent(BaseModel):

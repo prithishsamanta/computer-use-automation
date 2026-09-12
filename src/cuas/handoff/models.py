@@ -10,24 +10,25 @@ Model"). Field-for-field, this is that doc's own suggested shape:
 vocabulary was already scaffolded there in an earlier phase precisely for
 this type to use, rather than inventing a second one here.
 
-Two fields are deliberately left thin in this phase, not by oversight:
+One field is deliberately left thin, not by oversight: `evidence` is a
+small, optional freeform dict (e.g. a step id, an error code, a short
+human-readable summary) -- not the actual screenshot/DOM snapshot bytes.
+Those already live in EvidenceStore, addressable by this same
+`run_id`/`current_step`; an operator queue looks them up there rather
+than this record duplicating them.
 
-- `evidence` is a small, optional freeform dict (e.g. a step id, an error
-  code, a short human-readable summary) -- not the actual screenshot/DOM
-  snapshot bytes. Those already live in EvidenceStore, addressable by
-  this same `run_id`/`current_step`; an operator queue (Phase 12) looks
-  them up there rather than this record duplicating them.
-- `session_id` is always None as constructed by RunOrchestrator (Phase
-  11). `.CLAUDE/04` is explicit that a real handoff must NOT terminate
-  the live browser session -- the operator takes control of the *same*
-  session. Phase 11 does not yet keep a browser alive across the
-  request/response boundary (RunOrchestrator's `surface_factory` context
-  manager closes the surface before this record is even created) --
-  there is no live session for `session_id` to name yet. Introducing a
-  session registry that outlives one orchestrator call is exactly what
-  Phase 12 ("Intervention / human-handoff persistence + async resume")
-  is for; this field exists now so that later work is additive (setting
-  a value), not a schema change.
+`session_id` is no longer always `None` as of Phase 12: `RunOrchestrator`
+now keeps the live surface open across an escalation (see
+`cuas.handoff.session.SessionRegistry`) and sets this field to that
+session's id whenever one was created, satisfying .CLAUDE/04's "the
+operator takes control of the SAME live session" requirement that Phase
+11 explicitly could not yet meet. It can still legitimately be `None` in
+one case: `RunOrchestrator._materialize_capability` creates an
+intervention when a *successful* discovery run's trace can't be loaded or
+turned into an artifact -- at that point the discovery surface has
+already been closed (there is nothing further automation could do with
+it; the failure is in artifact construction, not the live page), so there
+is no session left to hand off.
 """
 
 from __future__ import annotations

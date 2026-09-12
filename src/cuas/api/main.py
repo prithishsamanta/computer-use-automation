@@ -1,13 +1,13 @@
 """Thin FastAPI entry point.
 
-Phase 1 added a health route only. Phase 11 adds the minimal HTTP surface
-this take-home needs to demonstrate the vertical slice end to end:
-`POST /runs` starts a run (capability resolution -> deterministic replay,
-or live discovery when nothing matches) and returns its structured
-result; `GET /runs/{run_id}` retrieves that same result again later. This
-is deliberately not the operator UI (Phase 12/13's job) -- there is no
-intervention claim/resolve endpoint here yet, just enough to start a run
-and read its outcome back.
+Phase 1 added a health route only. Phase 11 added the minimal HTTP surface
+to start a run and read its outcome back (`POST /runs`, `GET /runs/{run_id}`).
+Phase 12 adds the operator-facing side of the human-handoff seam: a
+pending-intervention queue and the claim -> complete -> resume lifecycle
+`.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md` describes. This is still
+deliberately not the operator UI (Phase 13's noVNC/remote-control wiring
+is what actually lets an operator *touch* the paused browser) -- just
+enough HTTP surface to drive that lifecycle and prove it end to end.
 
 This module is the composition root: every dependency `RunOrchestrator`
 needs is constructed once here, from `Settings`, and reused across
@@ -19,14 +19,20 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
-from cuas.api.schemas import RunRequest, RunResponse
+from cuas.api.schemas import (
+    DiscoveryGoalRequest,
+    InterventionResponse,
+    OperatorActionRequest,
+    RunRequest,
+    RunResponse,
+)
 from cuas.api.store import RunResultStore
 from cuas.artifact import FileArtifactRepository
 from cuas.capability import CapabilityService, FileCapabilityRepository
 from cuas.discovery import DiscoveryGoal, FileDiscoveryTraceStore
 from cuas.discovery.anthropic_client import AnthropicLLMClient
 from cuas.domain import AppContext
-from cuas.handoff import InMemoryInterventionRepository
+from cuas.handoff import FileInterventionRepository, HandoffError, InterventionRepository, InterventionRequest
 from cuas.observability.config import get_settings
 from cuas.observability.event_sink import JsonlEventSink
 from cuas.observability.evidence import FileEvidenceStore
@@ -48,18 +54,32 @@ _capability_service = CapabilityService(
 # documents.
 _llm = AnthropicLLMClient(_settings.anthropic_api_key) if _settings.anthropic_api_key else None
 
+# File-backed, not the in-memory placeholder Phase 11 used -- the "full
+# persistence implementation" this phase's instructions ask for. Kept as
+# its own name (`_interventions`) rather than only reachable through
+# `_orchestrator` because the read-only queue endpoints below (list/get)
+# have no session-registry side effects and so query it directly, while
+# every *mutating* endpoint (claim/complete/resume) goes through
+# `_orchestrator`, which is the only thing that also holds the
+# SessionRegistry those transitions need to touch.
+_interventions: InterventionRepository = FileInterventionRepository(_settings.intervention_dir)
+
 _orchestrator = RunOrchestrator(
     _capability_service,
     FileArtifactRepository(_settings.artifact_dir),
     LayeredPolicyEngine(),
     launch_playwright_surface,
-    InMemoryInterventionRepository(),
+    _interventions,
     FileDiscoveryTraceStore(_settings.discovery_trace_dir),
     llm=_llm,
     event_sink=JsonlEventSink(_settings.log_dir),
     evidence_store=FileEvidenceStore(_settings.evidence_dir),
 )
 _run_store = RunResultStore()
+
+
+def _intervention_response(intervention: InterventionRequest) -> InterventionResponse:
+    return InterventionResponse(**intervention.model_dump())
 
 
 @app.get("/health")
@@ -97,3 +117,74 @@ def get_run(run_id: str) -> RunResponse:
     if result is None:
         raise HTTPException(status_code=404, detail=f"no run with id {run_id!r}")
     return RunResponse(**result.model_dump())
+
+
+# -- human handoff (Phase 12) ------------------------------------------------
+
+
+@app.get("/interventions", response_model=list[InterventionResponse])
+def list_interventions(pending_only: bool = True) -> list[InterventionResponse]:
+    """Defaults to the operator's actual queue (PENDING only); pass
+    `?pending_only=false` to see the full history, claimed/resolved/
+    cancelled included."""
+
+    records = _interventions.list_pending() if pending_only else _interventions.list_all()
+    return [_intervention_response(r) for r in records]
+
+
+@app.get("/interventions/{intervention_id}", response_model=InterventionResponse)
+def get_intervention(intervention_id: str) -> InterventionResponse:
+    try:
+        return _intervention_response(_interventions.get(intervention_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/interventions/{intervention_id}/claim", response_model=InterventionResponse)
+def claim_intervention(intervention_id: str, request: OperatorActionRequest) -> InterventionResponse:
+    try:
+        updated = _orchestrator.claim_intervention(intervention_id, operator_id=request.operator_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HandoffError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _intervention_response(updated)
+
+
+@app.post("/interventions/{intervention_id}/complete", response_model=InterventionResponse)
+def complete_intervention(intervention_id: str, request: OperatorActionRequest) -> InterventionResponse:
+    """"Mark human control complete / request resume" -- the operator's
+    "I've resolved it, ready to hand back to automation" action. Does not
+    itself resume anything; call `POST /interventions/{id}/resume`
+    next."""
+
+    try:
+        updated = _orchestrator.mark_human_control_complete(intervention_id, operator_id=request.operator_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HandoffError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _intervention_response(updated)
+
+
+@app.post("/interventions/{intervention_id}/resume", response_model=RunResponse)
+async def resume_intervention(intervention_id: str) -> RunResponse:
+    try:
+        result = await _orchestrator.resume_run(intervention_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HandoffError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    _run_store.save(result)
+    return RunResponse(**result.model_dump())
+
+
+@app.post("/interventions/{intervention_id}/cancel", response_model=InterventionResponse)
+async def cancel_intervention(intervention_id: str, request: OperatorActionRequest) -> InterventionResponse:
+    try:
+        updated = await _orchestrator.cancel_intervention(intervention_id, operator_id=request.operator_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HandoffError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _intervention_response(updated)

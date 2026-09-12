@@ -1,13 +1,15 @@
 """Application settings, read from the environment.
 
-Kept intentionally small. DATABASE_URL (run/capability/intervention state)
-is still to come. log_dir/evidence_dir (Phase 7) are the file-backed roots
-for structured events (JsonlEventSink) and failure evidence
-(FileEvidenceStore); discovery_trace_dir (Phase 8) is the file-backed root
-for complete raw discovery traces (FileDiscoveryTraceStore); capability_dir
-(Phase 10) is the file-backed root for registered CapabilityRecords
-(FileCapabilityRepository) -- all plain directories on disk, no external
-logging/tracing/evidence/database service.
+Kept intentionally small. DATABASE_URL (run state) is still to come.
+log_dir/evidence_dir (Phase 7) are the file-backed roots for structured
+events (JsonlEventSink) and failure evidence (FileEvidenceStore);
+discovery_trace_dir (Phase 8) is the file-backed root for complete raw
+discovery traces (FileDiscoveryTraceStore); capability_dir (Phase 10) is
+the file-backed root for registered CapabilityRecords
+(FileCapabilityRepository); intervention_dir (Phase 12) is the file-backed
+root for persisted InterventionRequests (FileInterventionRepository) --
+all plain directories on disk, no external logging/tracing/evidence/
+database service.
 anthropic_api_key is read from ANTHROPIC_API_KEY when present but is never
 required for normal development or CI -- only AnthropicLLMClient
 (discovery/anthropic_client.py) needs it, and only for an actual live run.
@@ -30,6 +32,7 @@ class Settings(BaseSettings):
     log_dir: str = "data/logs"
     evidence_dir: str = "data/evidence"
     discovery_trace_dir: str = "data/discovery_traces"
+    intervention_dir: str = "data/interventions"
     anthropic_api_key: str | None = None
 
 

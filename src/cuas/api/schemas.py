@@ -1,16 +1,18 @@
-"""HTTP-facing request/response shapes for the /runs endpoints.
+"""HTTP-facing request/response shapes for the /runs and /interventions
+endpoints.
 
-Explicit Phase 11 instruction: "Keep API models separate from core domain
-models where appropriate so HTTP does not leak into the service layer."
-`RunOrchestrator` never imports FastAPI or anything from this module --
-these types exist only to translate one HTTP request into the call
-`RunOrchestrator.run_capability` already accepts (`AppContext`,
-`DiscoveryGoal`, plain `inputs`), and its `RunResult` back into a JSON
-response, so a later HTTP-only concern (pagination, auth, a versioned
-response envelope) never needs to touch `RunResult` itself. `RunResponse`
-is structurally identical to `RunResult` today; it stays a distinct type
-on purpose rather than aliasing it, so that stays true even after the two
-diverge.
+Explicit Phase 11 instruction, reaffirmed in Phase 12: "Keep API models
+separate from core domain models where appropriate so HTTP does not leak
+into the service layer." `RunOrchestrator` never imports FastAPI or
+anything from this module -- these types exist only to translate one HTTP
+request into the call `RunOrchestrator.run_capability`/`claim_intervention`/
+`mark_human_control_complete`/`resume_run` already accepts, and their
+results back into a JSON response, so a later HTTP-only concern
+(pagination, auth, a versioned response envelope) never needs to touch
+`RunResult`/`InterventionRequest` themselves. `RunResponse`/
+`InterventionResponse` are structurally identical to `RunResult`/
+`InterventionRequest` today; each stays a distinct type on purpose rather
+than aliasing, so that stays true even after they diverge.
 
 Reuses a couple of small, already-typed value objects directly
 (`WaitCondition`, `BusinessOutcome`) rather than re-declaring them --
@@ -20,12 +22,13 @@ not something the API boundary needs a second copy of.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from cuas.artifact.schema import BusinessOutcome
-from cuas.domain import ErrorCode
+from cuas.domain import ErrorCode, InterventionStatus
 from cuas.orchestration import RunOutcome
 from cuas.surface.adapter import WaitCondition
 
@@ -65,5 +68,36 @@ class RunResponse(BaseModel):
     error_message: str | None = None
     reason: str | None = None
     intervention_id: str | None = None
+    session_id: str | None = None
     artifact_version: str | None = None
     discovered_new_capability: bool = False
+
+
+class InterventionResponse(BaseModel):
+    """Mirrors `InterventionRequest` field-for-field (Phase 12) -- an
+    operator-facing queue's view of one escalation. `session_id` being
+    non-null is what tells an operator (or their tooling) a live browser
+    is genuinely still waiting, per .CLAUDE/04's handoff model."""
+
+    id: str
+    run_id: str
+    capability_id: str
+    tenant_id: str
+    current_step: str | None = None
+    reason: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    session_id: str | None = None
+    status: InterventionStatus
+    claimed_by: str | None = None
+    created_at: datetime
+    resolved_at: datetime | None = None
+
+
+class OperatorActionRequest(BaseModel):
+    """Body for the claim/complete endpoints. `operator_id` is the whole
+    of this take-home's authorization model -- an explicit, simple
+    stand-in for real IAM (see RunOrchestrator.mark_human_control_complete's
+    docstring and cuas.handoff.errors.InterventionOwnershipError), not a
+    session token or an authenticated identity."""
+
+    operator_id: str
