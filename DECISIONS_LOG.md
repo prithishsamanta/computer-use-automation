@@ -191,7 +191,7 @@ Default branch: `main`.
 7. ✅ Structured logging / evidence capture (observability package).
 8. ✅ LLM discovery loop, built and tested against fakes first (see Phase Log).
 9. ✅ Artifact builder (discovery run → cleaned, typed artifact; see Phase Log).
-10. ⬜ Capability service (context/version/tenant resolution at call time).
+10. ✅ Capability service (context/version/tenant resolution at call time; see Phase Log).
 11. ⬜ Run orchestrator + API.
 12. ⬜ Intervention / human-handoff persistence + async resume.
 13. ⬜ Full Docker setup for handoff: Xvfb + noVNC inside the automation
@@ -719,3 +719,122 @@ Default branch: `main`.
   + 12 integration, incl. the 1 new artifact-builder e2e test), no
   regressions. On-device unit suite reconfirmed green separately (94
   passed, 13 deselected) before committing.
+
+### Phase 10 — Capability service and artifact resolution
+
+- New `cuas.capability` package (`models.py`, `repository.py`,
+  `service.py`) implementing only the deterministic metadata-filter half
+  of `.CLAUDE/05_SURFACES_AND_MULTI_TENANCY.md`'s "Capability Retrieval"
+  flow (`request -> tenant/app context -> filter to compatible
+  vendor/application/version -> validate candidate compatibility -> select
+  artifact or DISCOVERY_REQUIRED`). No embeddings, no semantic similarity,
+  no vector store -- per the user's explicit instruction, that step is
+  deliberately left as a later stretch layer on top of this one. The
+  service is a plain Python class with two constructor dependencies
+  (`CapabilityRepository`, `ArtifactRepository`); it imports nothing
+  FastAPI-related, so an orchestrator can call it directly.
+- **`CapabilityRecord` is deliberately a separate, small, mutable
+  pointer, not the artifact itself** (`.CLAUDE/07`: "register/store
+  capability metadata separately from artifact files"). It carries
+  `capability_id`, `name`, `description`, `vendor`/`application`,
+  `supported_versions` (exact version or `"N.x"` major-version wildcard,
+  the same convention `ArtifactApplication.supported_versions` already
+  uses), `tenant_scope` (`"base"` sentinel or an exact `tenant_id`),
+  `artifact_version` (which published `Artifact` version this capability
+  currently resolves to), and `status` (`active`/`deprecated`/
+  `disabled`). Flipping `status` or repointing `artifact_version` is
+  ordinary metadata maintenance; it never touches a published `Artifact`
+  file, which stays immutable once versioned exactly as Phase 4 designed
+  it.
+- **Why `CapabilityRecord.tenant_scope` exists at all when
+  `ArtifactOverride` already has tenant-scoped overrides:** these are two
+  different concerns, not a duplicate mechanism. `ArtifactOverride`/
+  `resolve_artifact` (unchanged from Phase 4/5, reused as-is here) is a
+  *step-level patch* -- customizing specific step targets/values within
+  *one* artifact version, once a capability has already been matched.
+  `CapabilityRecord.tenant_scope` is an *eligibility filter* answering
+  "can this capability record even be considered for this tenant at
+  all" -- and, unlike a patch, it can legitimately point a specific
+  tenant at a genuinely different `artifact_version` when step-level
+  overrides alone aren't enough (`.CLAUDE/08` decision #9 prefers
+  overrides over full duplication but does not forbid this when a
+  tenant's workflow has truly diverged). A tenant-exact record is treated
+  as strictly *more specific* than a `"base"` record and wins when both
+  are compatible -- the same "most specific wins" rule
+  `LayeredPolicyEngine` already uses for policy layering, applied here to
+  capability selection instead.
+- **`CapabilityService.resolve(capability_id, context)` algorithm:** load
+  every `CapabilityRecord` for `capability_id`; none registered at all ->
+  `NO_CAPABILITY_MATCH` (reason: "no capability record registered").
+  Otherwise check each record's compatibility against the `AppContext`
+  (vendor/application exact match; `status == ACTIVE`; version compatible
+  per `supported_versions`; `tenant_scope` either `"base"` or an exact
+  match) and score its specificity (tenant-exact = 1, base = 0); zero
+  compatible records -> `NO_CAPABILITY_MATCH` (reason includes every
+  rejected record's specific incompatibility, e.g. "status is
+  'disabled'", "version '2.0.0' not in supported_versions ['1.x']",
+  "tenant_scope 'cu42' does not match requesting tenant 'cu99'"); more
+  than one record tied at the highest specificity -> `AMBIGUOUS` (refuses
+  to guess, exactly as instructed) rather than picking one arbitrarily;
+  otherwise load the matched record's pinned `artifact_version` via the
+  existing `ArtifactRepository.load`, load its overrides via
+  `load_overrides`, and call the **existing, unmodified**
+  `resolve_artifact(base, overrides, version=context.version,
+  tenant_id=context.tenant_id)` -> `RESOLVED` with the fully resolved
+  `Artifact`. A capability record whose pinned `artifact_version` has no
+  saved file (`FileNotFoundError`) is reported as `NO_CAPABILITY_MATCH`,
+  not a crash -- but a *schema-invalid* saved artifact
+  (`ArtifactInvalidError`) is deliberately left to propagate, since a
+  registered capability pointing at corrupted data is a genuine
+  data-integrity bug, not a routine "nothing matched" outcome.
+- **`CapabilityResolution.status` is `RESOLVED` / `NO_CAPABILITY_MATCH` /
+  `AMBIGUOUS` -- `DISCOVERY_REQUIRED` is deliberately NOT one of them.**
+  `.CLAUDE/06_ERRORS_AND_OBSERVABILITY.md` describes `NO_CAPABILITY_MATCH
+  -> DISCOVERY_REQUIRED` as normal control flow, but *deciding* to start
+  discovery (or queue a human, or something else) is the orchestrator's
+  job (Phase 11), not this service's -- `CapabilityService` only ever
+  reports what it found. A caller gets to "discovery required" by
+  branching on `status != RESOLVED`.
+- **`FileCapabilityRepository.save()` is deliberately the opposite of
+  `FileArtifactRepository.save()`.** The artifact repository refuses to
+  overwrite an existing version (a published `Artifact` is immutable
+  once versioned). A `CapabilityRecord` is a mutable pointer that is
+  *expected* to change in place (status flips, repointing to a newer
+  artifact version), so `FileCapabilityRepository.save()` is idempotent
+  overwrite-on-save, keyed by `(capability_id, vendor, application,
+  tenant_scope)` -- the tuple that uniquely identifies one record. Two
+  records may legitimately share a `capability_id` (a `"base"` record
+  plus a tenant-specific one), but never the same full key.
+- `tests/fixtures/fake_capability_repository.py`: a small in-memory
+  `CapabilityRepository` used only by `CapabilityService`'s own test
+  suite, so ambiguous-match scenarios can be constructed directly rather
+  than being accidentally impossible to express through
+  `FileCapabilityRepository`'s own uniqueness key (which, by
+  construction, can never hold two records tied on specificity for one
+  request). This mirrors the codebase's existing `fake_llm_client.py`/
+  `fake_surface.py` pattern of isolating logic tests from a real storage
+  or I/O implementation.
+- `tests/unit/test_capability_service.py` (14 tests) and
+  `tests/unit/test_capability_repository.py` (7 tests), all pure unit
+  tests against `tmp_path` and in-memory fakes -- no browser, no LLM.
+  Covers every scenario the user asked for: exact resolution;
+  version-specific override selection (and that a different, still
+  version-compatible request does *not* pick it up); tenant-specific
+  override selection (and that a different tenant does not); tenant
+  override winning over a version override for the same step, routed
+  through the service end-to-end; incompatible vendor/application,
+  version, and tenant each producing `NO_CAPABILITY_MATCH` with a
+  reason naming the specific mismatch; disabled and deprecated
+  capabilities (parametrized) producing `NO_CAPABILITY_MATCH`; ambiguous
+  equally-specific matches producing `AMBIGUOUS` rather than a guess; no
+  registered capability at all, and a capability pointing at a missing
+  artifact version, both producing `NO_CAPABILITY_MATCH` as a normal
+  structured result rather than an exception; a bonus test proving a
+  tenant-specific record's precedence over a base record end-to-end; and
+  `FileCapabilityRepository`'s own storage mechanics (round-trip,
+  overwrite-on-save for the same key, separate records for distinct
+  tenant scopes, per-capability vs. across-all listing, corrupt-file
+  handling).
+- On-device unit suite: 114 passed, 13 deselected (`not integration and
+  not live_llm`) -- no regressions. No cloud-sandbox round-trip needed
+  for this phase: nothing here touches Playwright or a real browser.
