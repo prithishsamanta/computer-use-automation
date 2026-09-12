@@ -6,12 +6,16 @@
 # Docker itself is installed and working on the user's actual Mac -- that
 # is where `docker compose build` / `up` get run and verified. Treat this
 # config as unverified-by-build until that happens; flag anything that
-# looks wrong when you do run it.
+# looks wrong when you do run it. This note now also covers Phase 13's
+# Xvfb/x11vnc/noVNC stack in the `automation` image -- none of it has
+# been exercised against a real Docker daemon from here either.
 #
 # Phase 2: demo-app (the legacy credit-union admin UI) + automation
-# (FastAPI skeleton only so far). Phase 13 adds Xvfb/x11vnc/noVNC to
-# `automation` so the operator can view/control the same live Playwright
-# session at http://localhost:6080 during a human handoff.
+# (FastAPI). Phase 13 adds Xvfb/x11vnc/noVNC to `automation` so an
+# operator can view/control the same live Playwright session at
+# http://localhost:6080/vnc.html during a human handoff -- see
+# docker/automation-entrypoint.sh and the Dockerfile for how, and
+# README.md for the manual verification checklist.
 services:
   demo-app:
     build:
@@ -19,16 +23,46 @@ services:
       dockerfile: demo_app/Dockerfile
     ports:
       - "8080:8080"
+    healthcheck:
+      # No curl in this deliberately minimal image (see its Dockerfile's
+      # own comment) -- a plain stdlib urllib request avoids adding a
+      # package just for the healthcheck.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   automation:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8000:8000"   # FastAPI (POST /runs, /interventions/*, /health)
+      - "6080:6080"   # noVNC web UI: http://localhost:6080/vnc.html?autoconnect=true
     volumes:
+      # Single mount covers every Settings.*_dir (all "data/..."):
+      # artifacts, capabilities, logs, evidence, discovery traces, and
+      # (Phase 12) interventions -- all persist across `docker compose
+      # up`/`down` cycles.
       - ./data:/app/data
     depends_on:
-      - demo-app
+      demo-app:
+        condition: service_healthy
+    # Runtime-injected, not baked into the image: values come from the
+    # host's own .env file (gitignored -- see .env's own comment) at
+    # `docker compose up` time. Currently only ANTHROPIC_API_KEY lives
+    # there; harmless/blank if you never intend to exercise live
+    # discovery.
+    env_file:
+      - .env
     environment:
+      # Not secrets -- plain configuration, fine to declare directly here.
       - DEMO_APP_BASE_URL=http://demo-app:8080
+      - PLAYWRIGHT_HEADLESS=false
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s

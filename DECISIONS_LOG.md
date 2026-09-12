@@ -194,8 +194,8 @@ Default branch: `main`.
 10. ✅ Capability service (context/version/tenant resolution at call time; see Phase Log).
 11. ✅ Run orchestrator + API (RunOrchestrator control-flow layer + thin FastAPI /runs route; see Phase Log).
 12. ✅ Intervention / human-handoff persistence + async resume (`SessionRegistry` keeps the live surface open across escalation; see Phase Log).
-13. ⬜ Full Docker setup for handoff: Xvfb + noVNC inside the automation
-    container.
+13. ✅ Full Docker setup for handoff: Xvfb + x11vnc + noVNC inside the
+    automation container (see Phase Log).
 14. ⬜ Scenario capture / demo recordings.
 15. ⬜ README + final report.
 
@@ -1178,3 +1178,127 @@ Default branch: `main`.
   not live_llm`) -- zero regressions from Phase 11's 130 (130 + 28 new =
   158). No cloud-sandbox round-trip needed for this phase: every new test
   is a pure unit test against fakes.
+
+### Phase 13 — Headed browser + Xvfb + noVNC Docker handoff path
+
+- **Goal, and what was deliberately NOT touched:** make Phase 12's
+  already-complete live-session handoff (`SessionRegistry` +
+  `InterventionRequest`) *observable and controllable* through the
+  canonical `docker compose` demo path, without redesigning any part of
+  that session lifecycle. No orchestration, `SessionRegistry`, or
+  `InterventionRequest` code changed this phase. `RunOrchestrator`/
+  `ReplayEngine`/`DiscoveryEngine` remain completely unaware that a human
+  might be watching over VNC -- as far as they're concerned, they're
+  driving one `SurfaceAdapter`, exactly as before.
+- **`Settings.playwright_headless: bool = True`** (new field) is the
+  entire code-level change needed. `api/main.py`'s composition root now
+  builds `_surface_factory = partial(launch_playwright_surface,
+  headless=_settings.playwright_headless)` instead of passing
+  `launch_playwright_surface` directly -- still a zero-arg callable
+  returning an async context manager, so `RunOrchestrator`'s
+  `SurfaceFactory` type and every existing call site are unaffected.
+  Local dev, the unit suite, and CI all keep the default `True`
+  (headless, no display needed); only the automation Compose service
+  overrides it to `false` via a plain (non-secret) environment variable.
+- **`launch_playwright_surface` (Phase 3, `surface/playwright_adapter.py`)
+  gained one conditional branch:** when `headless=False`, it launches
+  Chromium with `--start-maximized` and opens its context with
+  `no_viewport=True`, so the page fills whatever screen size Xvfb reports
+  instead of floating inside a fixed default viewport. Purely cosmetic
+  for the demo; the `headless=True` branch every existing test exercises
+  is byte-for-byte unchanged (`args=[]`, plain `new_context()`).
+- **Why noVNC is genuinely "the same session," not a second one:**
+  Playwright launches one headed Chromium process, which needs
+  somewhere to render -- `Xvfb` (Phase 13, new) provides that virtual X
+  display inside the container. `x11vnc` (new) serves that exact display
+  over VNC. `websockify`, using Debian/Ubuntu's `novnc` package's static
+  web client (both new), bridges that VNC stream to a browser tab over
+  WebSocket. None of these three is a browser, a CDP client, or anything
+  that could open its own Chromium -- they only relay pixels out and
+  mouse/keyboard input back in, to and from the one X display Chromium is
+  already attached to. An operator opening the noVNC tab is looking at,
+  and clicking into, the literal same window/CDP session
+  `RunOrchestrator`/`SessionRegistry` paused; there is no second surface
+  to create or reconcile.
+- **`docker/automation-entrypoint.sh`** (new) replaces the Dockerfile's
+  old plain `CMD ["uvicorn", ...]`. In order: starts `Xvfb` on `$DISPLAY`
+  (default `:99`) at a configurable `SCREEN_GEOMETRY` (default
+  `1280x800x24`); polls for the X11 socket to exist before continuing;
+  starts `x11vnc` against that display on `$VNC_PORT` (default `5900`);
+  starts `websockify` serving `novnc`'s static files and proxying
+  `$NOVNC_PORT` (default `6080`) to that x11vnc port; finally `exec`s
+  uvicorn as the container's actual foreground/signal-receiving process.
+  **Explicitly-flagged simplifications:** (1) `x11vnc -nopw` -- no VNC
+  password. Acceptable for a take-home demo whose ports are only
+  published to the host's own port mapping, not for anything exposed
+  beyond localhost without adding real VNC/noVNC auth first -- called out
+  in both the script and README.md. (2) No process supervisor
+  (supervisord/s6/etc): Xvfb/x11vnc/websockify are plain backgrounded
+  processes with no crash-restart logic; only a full `docker compose
+  restart automation` recovers if one dies. Both are documented,
+  deliberate, demo-scope trade-offs, not oversights.
+- **Dockerfile** (automation service): added `xvfb`, `x11vnc`, `novnc`,
+  `websockify` to the existing `apt-get install` step (same layer as
+  before, no new build stage), copies and chmods the new entrypoint
+  script into `/usr/local/bin/`, sets `ENV DISPLAY=:99` (so Playwright's
+  own `$DISPLAY` env lookup on Linux finds the right display without any
+  code change), exposes `6080` alongside the existing `8000`, and
+  replaces `CMD` with `ENTRYPOINT ["/usr/local/bin/automation-entrypoint.sh"]`.
+- **docker-compose.yml:** `automation` now also publishes `6080:6080`
+  (noVNC) and sets `PLAYWRIGHT_HEADLESS=false` directly in
+  `environment:` (not a secret, so no need to route it through `.env`).
+  Added `env_file: [.env]` to `automation` specifically so
+  `ANTHROPIC_API_KEY` (and any future secret) is injected into the
+  container's environment at `docker compose up` time from the
+  gitignored, host-side `.env` file -- never copied into the image by
+  either Dockerfile. `./data:/app/data` (unchanged from Phase 2) already
+  covers every `Settings.*_dir` (all `data/...`), so artifacts,
+  capabilities, logs, evidence, discovery traces, and interventions all
+  persist across `up`/`down` with no new mounts needed. Added a
+  `healthcheck` to both services (a plain stdlib `urllib` request against
+  each service's own health-ish endpoint -- deliberately not `curl`, to
+  avoid adding a package to either image just for this) and made
+  `automation` `depends_on: demo-app: condition: service_healthy`, so
+  Compose won't start automation racing an unready demo-app.
+- **Non-Docker verification, explicitly bounded:** this sandbox has no
+  Docker CLI/socket access, so `docker compose build`/`up` were not run
+  against the actual images -- that remains the user's own
+  `docker compose build && docker compose up` on their Mac, exactly as
+  every prior phase's Docker work has been. What *was* verified directly,
+  against a real Playwright/Chromium install outside Docker (same
+  cloud-sandbox round-trip pattern used for every prior phase's
+  Playwright-touching work): (1) the exact new `headless=False` launch
+  code (`--start-maximized` + `no_viewport=True`) actually launches and
+  navigates successfully under a real `Xvfb`; (2) the full `Xvfb -> x11vnc
+  -> websockify/noVNC` chain, using the identical commands and flags the
+  entrypoint script runs, actually comes up (all three processes attach
+  correctly, `GET /vnc.html` returns 200), and a real headed Chromium
+  launched against that same display renders correctly while the chain is
+  live. This is meaningfully more confidence than "the packages exist and
+  the shell script looks right," but it is still not a substitute for an
+  actual `docker compose build && up` -- flagged as such in README.md and
+  both Docker files' own comments, per the standing instruction never to
+  claim Docker verification that didn't happen.
+- **Tests** (8 new, all pure non-Docker unit tests -- no browser, no
+  Docker daemon, no Xvfb needed to run them):
+  `tests/unit/test_settings.py` (3 tests) covers
+  `Settings.playwright_headless`'s default and environment-variable
+  override. `tests/unit/test_docker_setup_config.py` (5 tests) pins the
+  plain-text contents of `Dockerfile`, `docker-compose.yml`, and
+  `docker/automation-entrypoint.sh` against the specific pieces this
+  phase depends on (the four new apt packages, the exposed ports, the
+  headed-mode env var, the entrypoint script's Xvfb/x11vnc/websockify
+  calls and its `exec uvicorn` as the literal last statement, the
+  `env_file`/no-`.env`-in-the-image split, and the compose healthcheck/
+  `depends_on` gate) -- explicitly framed in that file's own docstring as
+  config-drift protection, not Docker verification.
+- On-device unit suite: 166 passed, 13 deselected (`not integration and
+  not live_llm`) -- zero regressions from Phase 12's 158 (158 + 8 new =
+  166). No cloud-sandbox round-trip needed to run the on-device suite
+  itself (every new test is a pure unit test against fakes/plain text);
+  the cloud-sandbox round-trip described above was used only for the
+  extra, above-and-beyond manual verification of the headed-launch and
+  Xvfb/x11vnc/noVNC mechanics, not for running `pytest`.
+- **Not built this phase, by explicit instruction:** no Kubernetes, no
+  browser farm, no external queue, no remote browser service. Still a
+  single Compose file, two services, direct synchronous orchestration.

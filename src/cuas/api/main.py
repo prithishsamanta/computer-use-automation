@@ -4,10 +4,14 @@ Phase 1 added a health route only. Phase 11 added the minimal HTTP surface
 to start a run and read its outcome back (`POST /runs`, `GET /runs/{run_id}`).
 Phase 12 adds the operator-facing side of the human-handoff seam: a
 pending-intervention queue and the claim -> complete -> resume lifecycle
-`.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md` describes. This is still
-deliberately not the operator UI (Phase 13's noVNC/remote-control wiring
-is what actually lets an operator *touch* the paused browser) -- just
-enough HTTP surface to drive that lifecycle and prove it end to end.
+`.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md` describes. Phase 13 adds no new
+routes here at all -- it wires this same, already-complete lifecycle to a
+literal noVNC view/control surface at the Docker/Compose level (see
+Dockerfile, docker/automation-entrypoint.sh, docker-compose.yml). The one
+change in this file is `_surface_factory` below, which now threads
+`Settings.playwright_headless` through so the automation container can
+run headed under Xvfb while every other environment (local dev, unit
+tests, CI) keeps running headless exactly as before.
 
 This module is the composition root: every dependency `RunOrchestrator`
 needs is constructed once here, from `Settings`, and reused across
@@ -16,6 +20,8 @@ which is exactly why `RunOrchestrator` itself never imports FastAPI.
 """
 
 from __future__ import annotations
+
+from functools import partial
 
 from fastapi import FastAPI, HTTPException
 
@@ -64,11 +70,20 @@ _llm = AnthropicLLMClient(_settings.anthropic_api_key) if _settings.anthropic_ap
 # SessionRegistry those transitions need to touch.
 _interventions: InterventionRepository = FileInterventionRepository(_settings.intervention_dir)
 
+# Phase 13: the only change from a plain `launch_playwright_surface`
+# reference. `Settings.playwright_headless` defaults to True everywhere
+# except the automation Compose service (which sets
+# PLAYWRIGHT_HEADLESS=false, a plain non-secret env var, so it runs
+# headed under Xvfb -- see docker-compose.yml/Dockerfile). Still a
+# zero-arg callable returning an async context manager, so it satisfies
+# `RunOrchestrator`'s `SurfaceFactory` type exactly as before.
+_surface_factory = partial(launch_playwright_surface, headless=_settings.playwright_headless)
+
 _orchestrator = RunOrchestrator(
     _capability_service,
     FileArtifactRepository(_settings.artifact_dir),
     LayeredPolicyEngine(),
-    launch_playwright_surface,
+    _surface_factory,
     _interventions,
     FileDiscoveryTraceStore(_settings.discovery_trace_dir),
     llm=_llm,

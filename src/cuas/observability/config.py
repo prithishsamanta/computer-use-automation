@@ -15,6 +15,17 @@ required for normal development or CI -- only AnthropicLLMClient
 (discovery/anthropic_client.py) needs it, and only for an actual live run.
 Nothing here is a secret that should ever be logged -- see
 .CLAUDE/06_ERRORS_AND_OBSERVABILITY.md on redaction discipline.
+
+playwright_headless (Phase 13) is the one knob that turns the same
+`launch_playwright_surface` call headed or headless -- it does not
+change which code path runs, only an argument Playwright itself
+receives. Defaults to `True` (local dev, unit tests, CI: no display
+needed). The automation Docker image's Compose service overrides this to
+`false` via a plain (non-secret) environment variable, so the exact
+Chromium session `RunOrchestrator` is driving renders on the container's
+Xvfb display, where x11vnc/noVNC make it visible/controllable to a human
+operator during a handoff -- see the Dockerfile and docker-compose.yml
+for the rest of that wiring.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ class Settings(BaseSettings):
     discovery_trace_dir: str = "data/discovery_traces"
     intervention_dir: str = "data/interventions"
     anthropic_api_key: str | None = None
+    playwright_headless: bool = True
 
 
 def get_settings() -> Settings:

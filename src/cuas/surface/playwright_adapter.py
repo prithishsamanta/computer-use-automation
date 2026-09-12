@@ -173,16 +173,34 @@ async def launch_playwright_surface(headless: bool = True) -> AsyncIterator[Play
     """Own the browser/context/page lifecycle for one PlaywrightSurfaceAdapter.
 
     `headless` defaults to True (CI, and this sandbox's own verification
-    runs). Phase 13's Docker automation image runs headed under Xvfb, with
-    the resulting display exposed via noVNC for the human-handoff demo --
-    that only changes how the caller sets `headless`/DISPLAY, not this
-    adapter's code.
+    runs). Phase 13's Docker automation image runs this headed
+    (`headless=False`, via `Settings.playwright_headless` -- see
+    api/main.py's composition root) under Xvfb, with the resulting
+    display exposed through x11vnc/noVNC for the human-handoff demo. That
+    is the *only* thing this function does differently for Phase 13:
+    nothing about session ownership, pausing, or resume changes here --
+    `RunOrchestrator`/`SessionRegistry` hold the exact same
+    `PlaywrightSurfaceAdapter` either way, noVNC is purely a transport/
+    view/control layer onto the X display Chromium is already rendering
+    to, and an operator interacting with it is driving the SAME Chromium
+    window/CDP session automation paused, not a second one.
+
+    When `headless` is False, launches with `--start-maximized` and a
+    context with no fixed viewport (`no_viewport=True`) so the page fills
+    whatever screen size Xvfb reports (see the Dockerfile/entrypoint's
+    `SCREEN_GEOMETRY`) instead of Playwright's default small fixed
+    viewport floating inside a bigger window -- purely cosmetic for the
+    demo, and has zero effect on the (unchanged, still-True-by-default)
+    headless path every existing test and CI run exercises.
     """
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless)
+        launch_args = ["--start-maximized"] if not headless else []
+        browser = await playwright.chromium.launch(headless=headless, args=launch_args)
         try:
-            context = await browser.new_context()
+            context = await (
+                browser.new_context(no_viewport=True) if not headless else browser.new_context()
+            )
             page = await context.new_page()
             yield PlaywrightSurfaceAdapter(page)
         finally:
