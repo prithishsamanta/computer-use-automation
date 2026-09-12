@@ -190,7 +190,7 @@ Default branch: `main`.
    runtime policy (see Phase Log).
 7. ✅ Structured logging / evidence capture (observability package).
 8. ✅ LLM discovery loop, built and tested against fakes first (see Phase Log).
-9. ⬜ Artifact builder (discovery run → cleaned, typed artifact).
+9. ✅ Artifact builder (discovery run → cleaned, typed artifact; see Phase Log).
 10. ⬜ Capability service (context/version/tenant resolution at call time).
 11. ⬜ Run orchestrator + API.
 12. ⬜ Intervention / human-handoff persistence + async resume.
@@ -591,3 +591,131 @@ Default branch: `main`.
   regressions. On-device unit suite reconfirmed green separately (81
   passed, 12 deselected for `integration`/`live_llm`) before committing;
   the new `live_llm`-marked Anthropic test skips cleanly with no key set.
+
+
+### Phase 9 — Artifact construction from a successful discovery trace
+
+- **Small, necessary Phase 8 amendment, made first and called out
+  explicitly (per the standing instruction to state conflicts/trade-offs
+  and propose the smallest change rather than silently diverging):**
+  discovery's redaction switched from a flat, anonymous `"[REDACTED]"`
+  marker to *named* placeholders (`"{{member_id}}"`) --
+  `redact_named_values`/`redact_named_values_json`
+  (`observability/redaction.py`), replacing `redact_text`/`_redact_json`
+  everywhere in `discovery/engine.py`; `DiscoveryGoal.sensitive_values()`
+  became `named_sensitive_values() -> dict[str, str]`. Reason: Phase 9
+  needs a persisted trace's kept actions to already carry the exact
+  `{{input_name}}` placeholder syntax an `Artifact.Step.value` uses
+  (`.CLAUDE/02_ARTIFACT_SCHEMA.md`); a generic `"[REDACTED]"` marker made
+  that unrecoverable the moment more than one sensitive input existed,
+  since nothing said *which* input a given `"[REDACTED]"` came from.
+  Naming the placeholder is strictly as safe as the generic marker -- no
+  raw value survives either way -- so this was the smallest change that
+  unblocks Phase 9 without loosening Phase 8's "never persist a raw
+  sensitive value" guarantee. `DiscoveryHistoryEntry`/`DiscoveryTraceStep`
+  also gained a `read_value: str | None` field (redacted like every other
+  free-text field) -- Phase 8 never captured what a READ action actually
+  read (it let the model see effects only via the next page observation),
+  but Phase 9 needs to know what was read to infer a typed `OutputSpec`.
+  `DiscoveryEngine._execute` now returns that value instead of discarding
+  it. All 14 Phase 8 tests still pass after this change (one assertion
+  updated: `"[REDACTED]"` -> `"{{member_id}}"`); no other behavior
+  changed.
+- New `cuas.artifact_builder` package (`builder.py`: `ArtifactBuilder`,
+  `ArtifactBuildError`) -- stateless, deterministic, no LLM anywhere in
+  it. Depends on both `cuas.discovery` (reads a `DiscoveryTrace`/
+  `DiscoveryGoal`) and `cuas.artifact` (produces an `Artifact`) -- the
+  first package in this codebase that legitimately sits "above" two
+  existing ones rather than being a third parallel seam, since
+  artifact-from-trace construction is inherently a bridge between them.
+- **No LLM-authored artifact JSON, ever.** `build()` takes optional
+  `name`/`description` string overrides for exactly the case where a
+  human (or a model-assisted proposal a caller separately chose to trust)
+  wants better labels than the trace's own `capability_id`/
+  `goal_description` -- but those are just strings substituted into an
+  otherwise fully deterministic build; they cannot affect steps, inputs,
+  outputs, checkpoints, or safety metadata. Every constructed `Artifact`
+  still passes through `Artifact`'s own unmodified pydantic validators
+  before it can be returned or stored (`ValidationError` wrapped as
+  `ArtifactBuildError`) -- construction never bypasses schema validation
+  via `model_construct` or similar.
+- **Algorithm** (`ArtifactBuilder.build`): reject anything that isn't a
+  genuinely successful, well-formed trace first
+  (`_require_successful_trace`) -> keep only steps `DiscoveryEngine`
+  itself recorded as `outcome == "executed"` (`_select_successful_path`)
+  -- this alone is what excludes every failed detour, malformed-output
+  turn, and policy escalation, since none of those ever carry that
+  outcome -> collapse only an *exact, adjacent* duplicate action
+  conservatively (`_deduplicate_adjacent`; a non-adjacent repeat, e.g.
+  correcting course and coming back to the same field, is real history,
+  not redundancy, and is never touched) -> declare a typed `InputSpec`
+  per `DiscoveryGoal.inputs` name and placeholder-ize any of its raw
+  values still literally present in a kept action (`_build_inputs`/
+  `_placeholderize`; sensitive inputs already arrive placeholder-ized
+  from the Phase 8 amendment above -- this catches non-sensitive
+  declared inputs too, which a trace leaves as their literal value on
+  purpose for human readability) -> any kept `READ` action becomes a
+  typed `OutputSpec` instead of a replay `Step` (`_build_outputs`;
+  `OutputSpec.source` is what `ReplayEngine._extract_outputs` reads at
+  the end of a run, exactly matching the existing hand-authored
+  `get_savings_balance` convention -- a `READ` is never *also* replayed
+  as an inline step, which would read it twice) -> the output's
+  `OutputType` is inferred from what was actually read
+  (`_infer_output_type`: boolean-like text, then a numeric parse
+  distinguishing integer from decimal by the presence of a `.`, else
+  string) -> `goal.success_checkpoint`, if declared, becomes the
+  checkpoint on the last remaining (non-`READ`) step; `goal.
+  known_business_outcomes` carry forward verbatim into
+  `Artifact.business_outcomes` -> every constructed `Step` deliberately
+  leaves `risk` unset, exactly as `DiscoveryEngine` left `Action.risk`
+  unset on every proposal, so `LayeredPolicyEngine`'s fail-closed
+  behavior for an unrecognized intent governs a replay of this artifact
+  exactly the way it governed the original discovery run --
+  `ArtifactSafety` (informational only, same as always) summarizes
+  overall intent (the last step's) and risk (`SAFE`, since every kept
+  action already passed the real `PolicyEngine` during discovery -- this
+  module only ever sees the "executed" outcome).
+- **"No output" is a rejection, not a limitation quietly worked around.**
+  The existing `Artifact` schema's `SuccessCondition` only supports
+  `OUTPUT_VALID` (`.CLAUDE/02`); a successful discovery run with no `READ`
+  action anywhere in its kept path has nothing to hang a success
+  condition on, so `ArtifactBuilder` raises `ArtifactBuildError` rather
+  than inventing one. This doubles as one of the required "malformed/
+  incomplete successful traces are rejected" test cases -- it wasn't
+  designed as a test-passing trick, it's a genuine, honestly-reported
+  boundary of what this phase's construction can do.
+- `tests/unit/test_artifact_builder.py`: 13 tests against hand-crafted
+  `DiscoveryTrace`/`DiscoveryGoal` objects (no engine run needed) --
+  a clean successful trace becoming a correct artifact (steps, inputs,
+  outputs, output type inference, checkpoint carried onto the last step,
+  business outcomes carried forward, `risk` left unset, safety metadata),
+  a wrong-turn detour (an `execution_failed` step) excluded from the
+  result, a raw literal value becoming a `{{name}}` placeholder
+  independent of upstream redaction, five "malformed/incomplete" rejection
+  cases (not-success, no steps, no executed steps, no `READ`/output, a
+  corrupted kept action) grouped in one test class, adjacent-duplicate
+  collapse, non-adjacent-repeat preservation, provenance/version
+  metadata (including a non-semver version failing schema validation, not
+  just this module's own checks), and a round-trip save/load through the
+  real `FileArtifactRepository`.
+- `tests/integration/test_artifact_builder_e2e.py`: one real end-to-end
+  test -- a real `DiscoveryEngine` run (`FakeLLMClient`, no LLM key)
+  against the real demo app produces a real successful `DiscoveryTrace`;
+  `ArtifactBuilder` turns it into an `Artifact`; that artifact then
+  replays successfully through the real `ReplayEngine` against a *fresh*
+  page load using member `M1002` -- a member id that was never part of
+  the discovery run at all (discovery used `M1001`) -- and gets back the
+  correct, independently-seeded balance (`9900.00`). This is the concrete
+  proof that construction produces a genuinely reusable capability, not
+  just a replay of the exact run it came from. (First attempt at this
+  test used discovery-goal intents like `enter_member_id`/
+  `read_savings_balance` that aren't in `DEFAULT_GLOBAL_INTENT_POLICY`,
+  which correctly made every action `REQUIRE_APPROVAL` under
+  `LayeredPolicyEngine` -- fixed by using recognized SAFE intents
+  (`search_member`/`view_account`/`open_member_record`), which is the
+  policy engine working as designed, not a bug.)
+- Verified via the cloud-sandbox round-trip (`pytest -m "not live_llm"`):
+  106 tests pass total (94 unit, incl. the 13 new `ArtifactBuilder` tests,
+  + 12 integration, incl. the 1 new artifact-builder e2e test), no
+  regressions. On-device unit suite reconfirmed green separately (94
+  passed, 13 deselected) before committing.

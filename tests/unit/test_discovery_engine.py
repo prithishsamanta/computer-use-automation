@@ -65,7 +65,7 @@ async def test_normal_successful_discovery_executes_allowed_actions_and_stops_on
     # that's correct, the model needs the real value)...
     assert llm.calls[0][2].url == "http://fake.invalid/"
     # ...but never comes back raw in what DiscoveryEngine hands to a caller.
-    assert result.history[0].action.value == "[REDACTED]"
+    assert result.history[0].action.value == "{{member_id}}"
     assert "M1001" not in repr(result.history)
 
 

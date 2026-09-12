@@ -49,7 +49,7 @@ class DiscoveryGoal(BaseModel):
 
     `sensitive_inputs` names which of `inputs` must never appear in raw
     form in a persisted prompt/response/observation (redaction.redact_text
-    scrubs their *values*, looked up via `sensitive_values()`) --
+    scrubs their *values*, looked up via `named_sensitive_values()`) --
     discovery has no artifact InputSpec table yet to carry this instead
     (.CLAUDE/08 decision #6: the artifact doesn't exist until a later,
     separate construction step).
@@ -65,8 +65,13 @@ class DiscoveryGoal(BaseModel):
     success_checkpoint: WaitCondition | None = None
     known_business_outcomes: list[BusinessOutcome] = Field(default_factory=list)
 
-    def sensitive_values(self) -> list[str]:
-        return [str(self.inputs[name]) for name in self.sensitive_inputs if name in self.inputs]
+    def named_sensitive_values(self) -> dict[str, str]:
+        """name -> raw value, restricted to sensitive_inputs -- the shape
+        cuas.observability.redaction.redact_named_values/_json need to
+        produce a named placeholder (``{{name}}``) rather than a generic
+        marker. See that module's docstring for why the distinction
+        matters to artifact construction (Phase 9)."""
+        return {name: str(self.inputs[name]) for name in self.sensitive_inputs if name in self.inputs}
 
 
 class DiscoveryLimits(BaseModel):
@@ -112,6 +117,16 @@ class DiscoveryHistoryEntry(BaseModel):
     outcome: str  # "executed" | "execution_failed" | "policy_denied" | "approval_required"
     error_message: str | None = None
     observation_after: Observation | None = None
+    read_value: str | None = Field(
+        default=None,
+        description=(
+            "The raw string SurfaceAdapter.read() returned, when this action was a READ "
+            "(None otherwise). Discovery doesn't type/extract this the way an Artifact's "
+            "declared OutputSpec does -- it's carried here so a later artifact-construction "
+            "step (Phase 9) can infer a typed output from what was actually read, without "
+            "needing to re-run anything."
+        ),
+    )
 
 
 class DiscoveryResult(BaseModel):

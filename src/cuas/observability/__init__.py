@@ -1,7 +1,14 @@
 from cuas.observability.event_sink import EventSink, JsonlEventSink, NullEventSink
 from cuas.observability.events import EventType, RunEvent
 from cuas.observability.evidence import EvidenceRecord, EvidenceStore, FileEvidenceStore, NullEvidenceStore
-from cuas.observability.redaction import REDACTED, redact_dict, redact_inputs, redact_text
+from cuas.observability.redaction import (
+    REDACTED,
+    redact_dict,
+    redact_inputs,
+    redact_named_values,
+    redact_named_values_json,
+    redact_text,
+)
 
 __all__ = [
     "EventSink",
@@ -16,5 +23,7 @@ __all__ = [
     "REDACTED",
     "redact_dict",
     "redact_inputs",
+    "redact_named_values",
+    "redact_named_values_json",
     "redact_text",
 ]

@@ -48,6 +48,52 @@ def redact_dict(data: dict[str, Any], sensitive_keys: set[str]) -> dict[str, Any
     return {key: (REDACTED if key in sensitive_keys else value) for key, value in data.items()}
 
 
+def redact_named_values(text: str, named_values: dict[str, str]) -> str:
+    """Like redact_text, but replaces each value with a *named* placeholder
+    (``{{name}}``) instead of the generic REDACTED marker. Strictly as safe
+    -- no raw value survives either way -- but keeps which input a
+    substitution came from legible, which redact_text's anonymous marker
+    deliberately discards.
+
+    This is what makes a persisted discovery trace directly reusable as
+    artifact-construction input (Phase 9, cuas.artifact_builder): a value
+    already appears as ``"{{member_id}}"`` in the trace rather than a flat
+    ``"[REDACTED]"`` that could be any of several sensitive inputs, so
+    turning a successful trace into a reusable Artifact.Step doesn't
+    require recovering a raw value that was deliberately never persisted
+    anywhere -- the placeholder syntax an Artifact.Step.value already uses
+    (``.CLAUDE/02_ARTIFACT_SCHEMA.md``) is produced once, at redaction
+    time, not reconstructed later by guesswork.
+
+    Longer values are substituted first so a shorter value that happens to
+    be a substring of a longer one (e.g. "100" inside "1001") can't get
+    replaced first and corrupt the longer match.
+    """
+
+    if not text:
+        return text
+    redacted = text
+    for name, value in sorted(named_values.items(), key=lambda kv: -len(kv[1] or "")):
+        if value:
+            redacted = redacted.replace(value, "{{" + name + "}}")
+    return redacted
+
+
+def redact_named_values_json(value: Any, named_values: dict[str, str]) -> Any:
+    """Recursive version of redact_named_values for a JSON-shaped
+    dict/list/str structure -- e.g. a parsed Action's own
+    ``model_dump(mode="json")``, which can have a sensitive value nested
+    inside ``target.primary.params`` just as easily as in ``value``."""
+
+    if isinstance(value, str):
+        return redact_named_values(value, named_values)
+    if isinstance(value, dict):
+        return {key: redact_named_values_json(item, named_values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_named_values_json(item, named_values) for item in value]
+    return value
+
+
 def redact_text(text: str, sensitive_values: list[str]) -> str:
     """Scrubs every exact occurrence of each given raw value out of
     freeform text before it can be logged or persisted.

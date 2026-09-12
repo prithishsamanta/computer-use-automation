@@ -42,6 +42,21 @@ RunEvent; the raw (unredacted) values live only in the in-memory
 before that history is returned to a caller in a DiscoveryResult (see
 `_redact_history`) -- never log prompts/responses containing raw
 sensitive values without redaction.
+
+Redaction uses *named* placeholders (`{{member_id}}`), not a flat,
+anonymous "[REDACTED]" marker (`cuas.observability.redaction.
+redact_named_values`/`redact_named_values_json`) -- a small amendment
+made in Phase 9, not part of Phase 8's original delivery. The reason:
+Phase 9's artifact construction (`cuas.artifact_builder`) needs to turn a
+successful trace's actions into an Artifact.Step whose `value` already
+uses exactly this `{{input_name}}` placeholder syntax
+(.CLAUDE/02_ARTIFACT_SCHEMA.md); a generic "[REDACTED]" marker would have
+made that unrecoverable once more than one sensitive input existed, since
+nothing would say *which* input a given "[REDACTED]" came from. Naming
+the placeholder is strictly as safe as the generic marker -- no raw value
+survives either way -- so this was the smallest change that unblocks
+Phase 9 without loosening Phase 8's "never persist a raw sensitive value"
+guarantee.
 """
 
 from __future__ import annotations
@@ -64,7 +79,7 @@ from cuas.domain import Action, ActionType, AppContext, AutomationError, Locator
 from cuas.observability.event_sink import EventSink, NullEventSink
 from cuas.observability.events import EventType, RunEvent
 from cuas.observability.evidence import EvidenceStore, NullEvidenceStore
-from cuas.observability.redaction import redact_dict, redact_text
+from cuas.observability.redaction import redact_dict, redact_named_values, redact_named_values_json
 from cuas.safety import PolicyDecision, PolicyEngine
 from cuas.surface.adapter import SurfaceAdapter
 
@@ -85,22 +100,6 @@ _OUTCOME_CHECK_TIMEOUT_MS = 500
 _RECENT_ACTIONS_FOR_EVIDENCE = 5
 
 _SUPPORTED_LOCATOR_STRATEGIES = {LocatorStrategy.ROLE_NAME, LocatorStrategy.CSS}
-
-
-def _redact_json(value: Any, sensitive_values: list[str]) -> Any:
-    """Recursively applies redact_text to every string leaf of a
-    dict/list structure. Used for the model's raw proposal dict and for a
-    parsed Action's own JSON, since a sensitive value the model was given
-    as an input can just as easily show up nested inside either (e.g.
-    action.value == the raw member id it was told to type)."""
-
-    if isinstance(value, str):
-        return redact_text(value, sensitive_values)
-    if isinstance(value, dict):
-        return {key: _redact_json(item, sensitive_values) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_json(item, sensitive_values) for item in value]
-    return value
 
 
 class DiscoveryEngine:
@@ -133,7 +132,7 @@ class DiscoveryEngine:
     ) -> DiscoveryResult:
         run_id = run_id or uuid.uuid4().hex
         limits = limits or DiscoveryLimits()
-        sensitive_values = goal.sensitive_values()
+        named_values = goal.named_sensitive_values()
 
         self._emit(
             run_id,
@@ -152,7 +151,7 @@ class DiscoveryEngine:
             # a goal description commonly embeds the very input it's
             # describing (e.g. "Find member M1001..."), and this field is
             # persisted to disk like everything else in the trace.
-            goal_description=redact_text(goal.description, sensitive_values),
+            goal_description=redact_named_values(goal.description, named_values),
             started_at=datetime.now(timezone.utc),
         )
 
@@ -182,20 +181,20 @@ class DiscoveryEngine:
                 result = DiscoveryResult(
                     run_id=run_id, status=DiscoveryStatus.BUSINESS_OUTCOME, capability_id=goal.capability_id,
                     steps_taken=step_index, business_outcome_code=outcome_code,
-                    history=self._redact_history(history, sensitive_values),
+                    history=self._redact_history(history, named_values),
                 )
                 break
 
-            self._emit(run_id, EventType.STEP_STARTED, step_id=str(step_index), details={"url": redact_text(observation.url, sensitive_values)})
+            self._emit(run_id, EventType.STEP_STARTED, step_id=str(step_index), details={"url": redact_named_values(observation.url, named_values)})
 
             llm_response = await self._llm.propose_action(goal=goal, context=context, observation=observation, history=history)
             total_tokens += llm_response.input_tokens + llm_response.output_tokens
 
             trace_step = DiscoveryTraceStep(
                 step_index=step_index,
-                observation_url=redact_text(observation.url, sensitive_values),
-                observation_text_excerpt=redact_text(observation.visible_text[:_OBSERVATION_EXCERPT_CHARS], sensitive_values),
-                raw_model_output=redact_text(llm_response.raw_text, sensitive_values),
+                observation_url=redact_named_values(observation.url, named_values),
+                observation_text_excerpt=redact_named_values(observation.visible_text[:_OBSERVATION_EXCERPT_CHARS], named_values),
+                raw_model_output=redact_named_values(llm_response.raw_text, named_values),
             )
 
             if limits.max_total_tokens is not None and total_tokens > limits.max_total_tokens:
@@ -210,7 +209,7 @@ class DiscoveryEngine:
             action, done, parse_error = self._parse_proposal(llm_response)
 
             if parse_error is not None:
-                trace_step.parse_error = redact_text(parse_error, sensitive_values)
+                trace_step.parse_error = redact_named_values(parse_error, named_values)
                 trace_step.outcome = "malformed_model_output"
                 trace.steps.append(trace_step)
                 self._emit(
@@ -230,7 +229,7 @@ class DiscoveryEngine:
                     self._emit(run_id, EventType.RUN_COMPLETED, status="success", details={"status": "success"})
                     result = DiscoveryResult(
                         run_id=run_id, status=DiscoveryStatus.SUCCESS, capability_id=goal.capability_id,
-                        steps_taken=step_index + 1, history=self._redact_history(history, sensitive_values),
+                        steps_taken=step_index + 1, history=self._redact_history(history, named_values),
                     )
                     break
                 # The model is informed about policy but is never the final
@@ -255,7 +254,7 @@ class DiscoveryEngine:
                 last_signature = signature
 
             if consecutive_repeats >= limits.max_consecutive_repeats:
-                trace_step.parsed_action = _redact_json(action.model_dump(mode="json"), sensitive_values)
+                trace_step.parsed_action = redact_named_values_json(action.model_dump(mode="json"), named_values)
                 trace_step.outcome = "loop_detected"
                 trace.steps.append(trace_step)
                 self._emit(
@@ -271,7 +270,7 @@ class DiscoveryEngine:
 
             decision = self._policy.evaluate(action, context)
             trace_step.policy_decision = decision
-            trace_step.parsed_action = _redact_json(action.model_dump(mode="json"), sensitive_values)
+            trace_step.parsed_action = redact_named_values_json(action.model_dump(mode="json"), named_values)
             self._emit(run_id, EventType.POLICY_CHECKED, step_id=str(step_index), details={"decision": decision.value, "intent": action.intent})
 
             if decision in (PolicyDecision.DENY, PolicyDecision.REQUIRE_APPROVAL):
@@ -292,19 +291,22 @@ class DiscoveryEngine:
                 details={
                     "action_type": action.action_type.value,
                     "intent": action.intent,
-                    "reasoning": redact_text(llm_response.proposal.get("reasoning", "") if llm_response.proposal else "", sensitive_values),
+                    "reasoning": redact_named_values(llm_response.proposal.get("reasoning", "") if llm_response.proposal else "", named_values),
                 },
             )
 
             error_message: str | None = None
+            read_value: str | None = None
             try:
-                await self._execute(action)
+                read_value = await self._execute(action)
                 trace_step.outcome = "executed"
             except (AutomationError, ValueError) as exc:
                 error_message = str(exc)
                 trace_step.outcome = "execution_failed"
-                trace_step.execution_error = redact_text(error_message, sensitive_values)
+                trace_step.execution_error = redact_named_values(error_message, named_values)
                 await self._capture_step_failure_evidence(run_id, step_index, exc, history)
+
+            trace_step.read_value = redact_named_values(read_value, named_values) if read_value is not None else None
 
             self._emit(
                 run_id,
@@ -328,6 +330,7 @@ class DiscoveryEngine:
                     outcome=trace_step.outcome,
                     error_message=error_message,
                     observation_after=observation,
+                    read_value=read_value,
                 )
             )
         else:
@@ -409,23 +412,32 @@ class DiscoveryEngine:
 
     # -- execution ------------------------------------------------------
 
-    async def _execute(self, action: Action) -> None:
+    async def _execute(self, action: Action) -> str | None:
+        """Returns the raw string a READ action read (None for every
+        other action type) -- captured so a later, successful trace can
+        tell artifact construction (Phase 9, cuas.artifact_builder) what
+        was actually read, letting it infer a typed OutputSpec instead of
+        guessing one."""
+
         if action.action_type == ActionType.FILL:
             if action.target is None or action.value is None:
                 raise ValueError(f"FILL requires target and value (intent={action.intent!r})")
             await self._surface.fill(action.target, action.value)
+            return None
         elif action.action_type in (ActionType.CLICK, ActionType.DISMISS):
             if action.target is None:
                 raise ValueError(f"{action.action_type.value} requires target (intent={action.intent!r})")
             await self._surface.click(action.target)
+            return None
         elif action.action_type == ActionType.NAVIGATE:
             if action.value is None:
                 raise ValueError(f"NAVIGATE requires value, the URL (intent={action.intent!r})")
             await self._surface.navigate(action.value)
+            return None
         elif action.action_type == ActionType.READ:
             if action.target is None:
                 raise ValueError(f"READ requires target (intent={action.intent!r})")
-            await self._surface.read(action.target)
+            return await self._surface.read(action.target)
         else:
             raise ValueError(f"unsupported action_type for discovery: {action.action_type}")
 
@@ -547,11 +559,11 @@ class DiscoveryEngine:
             escalation_step_index=steps_taken if is_escalation else None,
             escalation_reason=reason if is_escalation else None,
             error_message=None if is_escalation else reason,
-            history=self._redact_history(history, goal.sensitive_values()),
+            history=self._redact_history(history, goal.named_sensitive_values()),
         )
 
     def _redact_history(
-        self, history: list[DiscoveryHistoryEntry], sensitive_values: list[str]
+        self, history: list[DiscoveryHistoryEntry], named_values: dict[str, str]
     ) -> list[DiscoveryHistoryEntry]:
         """The boundary where discovery's internal, necessarily-raw
         working history (AnthropicLLMClient needs real values to keep
@@ -559,28 +571,29 @@ class DiscoveryEngine:
         caller or persist -- never log prompts/responses containing raw
         sensitive values without redaction."""
 
-        if not sensitive_values:
+        if not named_values:
             return list(history)
 
         redacted: list[DiscoveryHistoryEntry] = []
         for entry in history:
             redacted_action = entry.action.model_copy(
-                update={"value": redact_text(entry.action.value, sensitive_values) if entry.action.value else entry.action.value}
+                update={"value": redact_named_values(entry.action.value, named_values) if entry.action.value else entry.action.value}
             )
             redacted_observation = None
             if entry.observation_after is not None:
                 redacted_observation = entry.observation_after.model_copy(
                     update={
-                        "url": redact_text(entry.observation_after.url, sensitive_values),
-                        "visible_text": redact_text(entry.observation_after.visible_text, sensitive_values),
+                        "url": redact_named_values(entry.observation_after.url, named_values),
+                        "visible_text": redact_named_values(entry.observation_after.visible_text, named_values),
                     }
                 )
             redacted.append(
                 entry.model_copy(
                     update={
                         "action": redacted_action,
-                        "error_message": redact_text(entry.error_message, sensitive_values) if entry.error_message else entry.error_message,
+                        "error_message": redact_named_values(entry.error_message, named_values) if entry.error_message else entry.error_message,
                         "observation_after": redacted_observation,
+                        "read_value": redact_named_values(entry.read_value, named_values) if entry.read_value else entry.read_value,
                     }
                 )
             )

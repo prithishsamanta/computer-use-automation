@@ -45,6 +45,12 @@ class DiscoveryTraceStep(BaseModel):
     policy_decision: PolicyDecision | None = None
     execution_error: str | None = None
     outcome: str = ""
+    read_value: str | None = Field(
+        default=None,
+        description="The raw string read() returned for a READ action, redacted like every "
+        "other free-text field here -- carried so artifact construction (Phase 9) can infer "
+        "a typed output from what was actually read.",
+    )
 
 
 class DiscoveryTrace(BaseModel):
