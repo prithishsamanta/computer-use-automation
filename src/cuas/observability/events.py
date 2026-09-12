@@ -35,6 +35,19 @@ class EventType(str, Enum):
     # no replay analogue.
     LLM_ACTION_PROPOSED = "llm_action_proposed"
     MALFORMED_MODEL_OUTPUT = "malformed_model_output"
+    # Phase 11 (RunOrchestrator) additions -- component="run_orchestrator".
+    # Names match .CLAUDE/06_ERRORS_AND_OBSERVABILITY.md's own "Structured
+    # Logging" example list verbatim where it names one
+    # (capability_search_started, capability_match_found, discovery_started);
+    # DISCOVERY_REQUIRED and INTERVENTION_REQUESTED extend that vocabulary
+    # for the two outcomes the doc's "Capability Routing Outcomes" and
+    # "Human Intervention" sections describe but don't give an explicit
+    # event name for.
+    CAPABILITY_SEARCH_STARTED = "capability_search_started"
+    CAPABILITY_MATCH_FOUND = "capability_match_found"
+    DISCOVERY_REQUIRED = "discovery_required"
+    DISCOVERY_STARTED = "discovery_started"
+    INTERVENTION_REQUESTED = "intervention_requested"
 
 
 class RunEvent(BaseModel):

@@ -192,7 +192,7 @@ Default branch: `main`.
 8. ✅ LLM discovery loop, built and tested against fakes first (see Phase Log).
 9. ✅ Artifact builder (discovery run → cleaned, typed artifact; see Phase Log).
 10. ✅ Capability service (context/version/tenant resolution at call time; see Phase Log).
-11. ⬜ Run orchestrator + API.
+11. ✅ Run orchestrator + API (RunOrchestrator control-flow layer + thin FastAPI /runs route; see Phase Log).
 12. ⬜ Intervention / human-handoff persistence + async resume.
 13. ⬜ Full Docker setup for handoff: Xvfb + noVNC inside the automation
     container.
@@ -838,3 +838,176 @@ Default branch: `main`.
 - On-device unit suite: 114 passed, 13 deselected (`not integration and
   not live_llm`) -- no regressions. No cloud-sandbox round-trip needed
   for this phase: nothing here touches Playwright or a real browser.
+
+### Phase 11 — `RunOrchestrator` + API integration
+
+- New `cuas.orchestration` package (`models.py`, `orchestrator.py`)
+  implementing the control-flow layer named in `.CLAUDE/07`'s suggested
+  package shape. `RunOrchestrator.run_capability(capability_id, inputs,
+  context, *, discovery_goal=None, run_id=None) -> RunResult` is the
+  entire public surface: `request -> CapabilityService.resolve -> RESOLVED
+  branches to ReplayEngine.run, NO_CAPABILITY_MATCH branches to
+  DiscoveryEngine.run when a `discovery_goal` was supplied (else reports
+  `DISCOVERY_REQUIRED` immediately), AMBIGUOUS is reported as its own
+  outcome`. It never reimplements replay, policy, capability-resolution,
+  or discovery logic -- every step is a direct call into the existing
+  Phase 5/6/8/9/10 components, with only their `Status` enums translated
+  into `RunOutcome` and, on escalation, an `InterventionRequest` built
+  from their result fields. This was checked explicitly against the
+  phase instruction ("do not move replay logic, policy logic, artifact
+  resolution, or discovery internals into the orchestrator") before
+  committing.
+- **`SurfaceFactory = Callable[[], AbstractAsyncContextManager[SurfaceAdapter]]`**
+  is the one new seam `RunOrchestrator` depends on beyond the existing
+  services. It matches `launch_playwright_surface`'s exact shape (an
+  `@asynccontextmanager`-decorated function) precisely so the real API
+  composition root can pass that function directly, while tests pass a
+  fake factory that hands out scripted `FakeSurfaceAdapter`s -- the
+  orchestrator asks for a fresh surface per replay/discovery attempt and
+  never owns surface lifecycle itself, matching every existing
+  integration test's "one `launch_playwright_surface()` call per attempt"
+  pattern (see `test_artifact_builder_e2e.py`).
+- **Run ID propagation:** `run_capability` generates `run_id =
+  uuid.uuid4().hex` when the caller doesn't supply one, then threads that
+  exact value through every downstream call that accepts one --
+  `ReplayEngine.run(..., run_id=run_id)`, `DiscoveryEngine.run(...,
+  run_id=run_id)`, every `_emit(run_id, ...)` structured-log event, and
+  the `InterventionRequest.run_id` field on escalation -- so a single
+  `run_id` correlates logging, the discovery trace file, replay evidence,
+  and (once Phase 12 persists them) intervention records end to end.
+  Covered explicitly by `TestRunIdCorrelation`.
+- **Replay-after-discovery, not output-extraction-in-the-orchestrator:**
+  `DiscoveryResult` (Phase 8) carries step history and a `capability_id`,
+  not typed/named outputs -- turning a trace into named, typed outputs is
+  `ArtifactBuilder`'s job applied to a trace (Phase 9), and *re-reading*
+  those outputs deterministically from a stored artifact is
+  `ReplayEngine`'s job (Phase 5). Rather than duplicate
+  `ReplayEngine._parse_output`'s type-conversion logic inside the
+  orchestrator to derive a `SUCCESS` result's outputs straight from the
+  discovery trace, `RunOrchestrator` on a successful discovery: (1) loads
+  the just-written `DiscoveryTrace` via the injected `DiscoveryTraceStore`,
+  (2) calls `ArtifactBuilder().build(...)` and saves the artifact via the
+  injected `ArtifactRepository`, (3) registers a new `CapabilityRecord`
+  pointing at it via `CapabilityService`, then (4) immediately calls
+  `ReplayEngine.run` again -- against a **second**, freshly obtained
+  surface -- with the original request's `inputs`, and returns *that*
+  result to the caller. This means a capability's first-ever invocation
+  costs one extra live browser session (discovery, then a verification
+  replay) versus every subsequent call (resolved capability, one replay
+  only), which was accepted as the right trade-off specifically to avoid
+  violating the "do not duplicate replay logic" constraint. Documented at
+  length in `orchestrator.py`'s `_materialize_capability` docstring.
+- **Newly-discovered capabilities register with `tenant_scope =
+  context.tenant_id`, not the `"base"` sentinel.** Discovery only ever
+  demonstrates a workflow against one tenant's live application instance;
+  broadening a freshly-learned capability to every tenant of that
+  vendor/application is a deliberate, separate operator decision (in the
+  spirit of `.CLAUDE/08` decision #9's "prefer overrides over full
+  duplication" -- which argues against *needless* duplication, not
+  against tenant-scoping something that hasn't been proven to generalize
+  yet). An operator can widen an existing record's `tenant_scope` to
+  `"base"` later; `RunOrchestrator` never does this automatically.
+- **Escalation is created for `APPROVAL_REQUIRED` and hard `FAILED`
+  outcomes, deliberately NOT for `BLOCKED`.** The phase instructions name
+  exactly two triggers for the intervention seam: "policy approval
+  requirement" and "unresolved failure." A policy `DENY` (`BLOCKED`) is a
+  *terminal refusal* -- there is nothing for a human operator to approve,
+  since the system has already decided the action must not happen -- so
+  `RunOrchestrator` reports `RunOutcome.BLOCKED` directly with no
+  `InterventionRequest`. `APPROVAL_REQUIRED` (a policy asking for sign-off
+  before proceeding) and `FAILED` (replay/discovery gave up after bounded
+  recovery) both create an `InterventionRequest` via the injected
+  `InterventionRepository`, since both describe a state a human can
+  actually act on. This is an interpretation choice, not something the
+  phase instructions spelled out explicitly, and is called out as such in
+  code comments per the standing instruction to flag judgment calls
+  rather than let them pass silently.
+- **Known, explicitly-flagged limitation carried into Phase 12:**
+  `.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md` requires that creating an
+  intervention must NOT terminate the live browser session, so a human
+  operator can resume the in-progress workflow exactly where it stopped.
+  Phase 11 does **not** satisfy this. `RunOrchestrator` obtains each
+  surface via `async with self._surface_factory() as surface:`, and that
+  `async with` block -- and therefore the browser session -- closes
+  before control ever returns far enough up the stack to construct an
+  `InterventionRequest`. There is no session registry yet capable of
+  holding a live `SurfaceAdapter` open across the request/response
+  boundary while a human is paged. Rather than build a partial, likely
+  wrong version of that infrastructure under this phase's scope, this was
+  left as an explicit, documented gap: `InterventionRequest.session_id`
+  is hard-coded to `None` for the whole of Phase 11 (see the extensive
+  docstring on that field in `handoff/models.py`), and Phase 12
+  ("Intervention / human-handoff persistence + async resume") is exactly
+  where the session-registry work belongs per the user's own 15-phase
+  plan. **This is the single most important trade-off from this phase to
+  keep in view going into Phase 12.**
+- **`cuas.handoff` package** (`models.py`, `repository.py`): first cut of
+  the intervention seam named in `.CLAUDE/07`'s suggested interfaces.
+  `InterventionRequest` (id, run_id, capability_id, tenant_id,
+  current_step, reason, evidence, session_id, status, claimed_by,
+  created_at, resolved_at) is intentionally thin -- `evidence` is a small
+  freeform dict of pointers/summary fields, not embedded screenshot
+  bytes, which continue to live in `EvidenceStore` (Phase 7) and are
+  referenced, not duplicated. `InterventionRepository` (ABC) +
+  `InMemoryInterventionRepository` (real, minimal implementation) follow
+  the same one-ABC-one-implementation pattern as every other seam in this
+  codebase; per the phase instruction, the *full* persistence
+  implementation (a file- or DB-backed repository, claim/resolve
+  workflows, the operator-facing read side) is deferred to Phase 12 --
+  Phase 11 only needs interventions to be *creatable* and *listable*
+  behind an interface.
+- **API models kept structurally separate from orchestration models, per
+  explicit instruction, even though they currently look similar.**
+  `cuas.api.schemas` (`RunRequest`, `RunResponse`, `DiscoveryGoalRequest`)
+  are plain Pydantic models owned by the HTTP layer; `cuas.orchestration
+  .models.RunResult` is the domain-level return type `RunOrchestrator`
+  actually produces. `api/main.py` translates between them at the
+  boundary (`RunResponse(**result.model_dump())`) rather than
+  `RunOrchestrator` importing or returning an API type, so the service
+  layer has zero FastAPI/HTTP awareness -- `RunOrchestrator` could be
+  called from a CLI or a queue worker with no changes.
+- **Thin FastAPI layer** (`api/main.py`, `api/schemas.py`, `api/store.py`):
+  `api/main.py` is a pure composition root -- every dependency
+  `RunOrchestrator` needs (`CapabilityService`, `FileArtifactRepository`,
+  `LayeredPolicyEngine`, `launch_playwright_surface`,
+  `InMemoryInterventionRepository`, `FileDiscoveryTraceStore`, the
+  optional `AnthropicLLMClient`, `JsonlEventSink`, `FileEvidenceStore`) is
+  constructed once from `Settings` and reused across requests. `POST
+  /runs` builds an `AppContext` and optional `DiscoveryGoal` from the
+  request body and calls `run_capability`; `GET /runs/{run_id}` reads
+  back a previously saved `RunResult` from `RunResultStore`, an in-memory
+  dict that is deliberately *not* part of `RunOrchestrator` itself --
+  it's the API layer's own bookkeeping for "retrieve a result later,"
+  which the orchestrator's own synchronous request/response contract
+  doesn't need. No intervention claim/resolve endpoints yet -- this is
+  explicitly not the operator UI (Phase 12/13's job).
+- `Settings.capability_dir` and five new `EventType` members
+  (`capability_search_started`, `capability_match_found`,
+  `discovery_required`, `discovery_started`, `intervention_requested`)
+  were added to the existing `observability` package to match
+  `.CLAUDE/06`'s structured-logging event vocabulary and give
+  `RunOrchestrator` a real, file-backed `CapabilityRepository` path in
+  the API composition root.
+- `tests/unit/test_run_orchestrator.py` (13 tests, pure unit tests against
+  `FakeSurfaceAdapter`/`FakeLLMClient`, no browser, no live LLM): known
+  capability -> replay success, business outcome, approval-required
+  (creates intervention), blocked (creates no intervention), hard failure
+  (creates intervention); no capability + no goal -> `DISCOVERY_REQUIRED`,
+  no capability + goal but no LLM configured -> `DISCOVERY_REQUIRED`,
+  ambiguous match -> `AMBIGUOUS_CAPABILITY` without attempting discovery;
+  successful discovery -> artifact built/stored/registered and replayed
+  for the actual result, discovery approval-required / blocked / hard
+  failure (approval and failure create interventions, blocked does not);
+  and one test proving a single `run_id` correlates the discovery trace
+  file and the follow-up replay. `tests/unit/test_api_runs.py` (3 tests)
+  is a thin smoke test of the real FastAPI composition root via
+  `TestClient`, deliberately restricted to the one branch that's always
+  safe to hit without Playwright (an unregistrable capability_id with no
+  discovery goal resolves to `DISCOVERY_REQUIRED` before
+  `run_capability` ever touches `surface_factory`) -- every other branch
+  is already covered against `RunOrchestrator` directly, so re-proving it
+  through HTTP would only be slower, not more thorough.
+- On-device unit suite: 130 passed, 13 deselected (`not integration and
+  not live_llm`) -- zero regressions from Phase 10's 114. No
+  cloud-sandbox round-trip needed for this phase: `test_run_orchestrator
+  .py` and `test_api_runs.py` are both pure unit tests against fakes.
