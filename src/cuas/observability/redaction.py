@@ -35,3 +35,38 @@ def redact_inputs(artifact: Artifact, inputs: dict[str, Any]) -> dict[str, Any]:
         spec = artifact.inputs.get(name)
         redacted[name] = REDACTED if (spec is not None and spec.sensitive) else value
     return redacted
+
+
+def redact_dict(data: dict[str, Any], sensitive_keys: set[str]) -> dict[str, Any]:
+    """The same idea as redact_inputs, generalized to any dict of named
+    values without requiring an Artifact's InputSpec table. Discovery
+    (Phase 8) doesn't have artifact-declared inputs yet -- there is no
+    artifact until a later, separate construction step -- so it names its
+    own sensitive inputs directly (DiscoveryGoal.sensitive_inputs) and
+    calls this instead of redact_inputs."""
+
+    return {key: (REDACTED if key in sensitive_keys else value) for key, value in data.items()}
+
+
+def redact_text(text: str, sensitive_values: list[str]) -> str:
+    """Scrubs every exact occurrence of each given raw value out of
+    freeform text before it can be logged or persisted.
+
+    Discovery's prompts, model responses, and page observations are
+    unstructured text, not a dict of named fields -- redact_inputs/
+    redact_dict don't apply. This is the freeform equivalent: given the
+    raw sensitive values themselves (e.g. the actual member ID string,
+    not its field name), replace every occurrence wherever it appears.
+    Deliberately simple substring replacement, not a regex or NLP
+    approach -- a sensitive value discovery cares about is always an
+    exact, known string (it came from DiscoveryGoal.inputs), never a
+    pattern to be inferred from the text.
+    """
+
+    if not text:
+        return text
+    redacted = text
+    for value in sensitive_values:
+        if value:
+            redacted = redacted.replace(value, REDACTED)
+    return redacted

@@ -189,7 +189,7 @@ Default branch: `main`.
    replacing Phase 5's 1:1 `RiskBasedPolicyEngine` placeholder as the real
    runtime policy (see Phase Log).
 7. ✅ Structured logging / evidence capture (observability package).
-8. ⬜ LLM discovery loop, built and tested against fakes first.
+8. ✅ LLM discovery loop, built and tested against fakes first (see Phase Log).
 9. ⬜ Artifact builder (discovery run → cleaned, typed artifact).
 10. ⬜ Capability service (context/version/tenant resolution at call time).
 11. ⬜ Run orchestrator + API.
@@ -410,3 +410,184 @@ Default branch: `main`.
 - Verified via the cloud-sandbox round-trip: 76 tests pass total (67 unit
   + 9 integration), no regressions. On-device unit suite reconfirmed green
   (67 passed) before committing.
+
+
+### Phase 8 — LLM discovery loop
+
+- New `cuas.discovery` package: `models.py` (`DiscoveryGoal`,
+  `DiscoveryLimits`, `DiscoveryStatus`, `DiscoveryHistoryEntry`,
+  `DiscoveryResult`), `trace.py` (`DiscoveryTrace`, `DiscoveryTraceStep`,
+  `DiscoveryTraceStore` ABC + `NullDiscoveryTraceStore` +
+  `FileDiscoveryTraceStore`), `llm_client.py` (`LLMClient` ABC,
+  `LLMResponse`), `anthropic_client.py` (`AnthropicLLMClient`, the one real
+  implementation), `engine.py` (`DiscoveryEngine`). Same
+  one-ABC-one-real-implementation shape as every other seam in this
+  codebase.
+- **Loop, exactly as specified:** observe -> ask the model for a
+  structured action -> validate/parse -> run through the same
+  `PolicyEngine` `ReplayEngine` uses -> execute through the same
+  `SurfaceAdapter` -> observe again -> repeat until success / a known
+  business outcome / a hard stop. `DiscoveryEngine` depends on
+  `SurfaceAdapter`/`PolicyEngine` exactly like `ReplayEngine` does --
+  neither abstraction needed to change at all for a second caller to show
+  up, which is the whole point of having depended on interfaces from
+  Phase 3/6 onward.
+- **The model never executes anything.** `LLMClient.propose_action`
+  returns a raw, untyped `LLMResponse.proposal` dict; turning that into a
+  real, schema-valid `Action` (or rejecting it) is entirely
+  `DiscoveryEngine._parse_proposal`'s job, not any given client's. This is
+  deliberate: it means `FakeLLMClient` (tests) and the real
+  `AnthropicLLMClient` are validated by the exact same parsing code, so a
+  test proving "malformed output stops the run" is proving something true
+  of the real integration too, not just of the fake.
+- **LLM-proposed actions never get `Action.risk` set explicitly.** This
+  was Phase 6's payoff arriving on schedule, not new code:
+  `LayeredPolicyEngine` already treats an intent that matches no policy
+  layer AND has no explicitly-set `risk` (via `model_fields_set`) as
+  contributing zero opinions, which resolves to `REQUIRE_APPROVAL`. By
+  simply never setting `risk` when constructing an `Action` from a parsed
+  model proposal, every LLM proposal with an intent the policy tables
+  don't specifically recognize automatically fails closed to
+  human-approval-required -- no discovery-specific safety code needed,
+  and no way for a model to talk its way into `SAFE` by self-declaring
+  its own risk.
+- **Policy DENY/REQUIRE_APPROVAL is terminal, exactly like replay.** "Stop
+  or escalate rather than being 'fixed' by guessing" is implemented
+  literally: a policy-denied or approval-required proposal ends the run
+  (`DiscoveryStatus.BLOCKED` / `APPROVAL_REQUIRED`) immediately. Discovery
+  never tries a different action after a policy escalation.
+- **A genuine execution failure is NOT terminal, unlike replay** -- the one
+  place discovery is deliberately more lenient than `ReplayEngine`.
+  `TargetNotFoundError` (the model guessed a control that isn't there) or
+  a plain `ValueError` (a structurally valid but semantically incomplete
+  proposal, e.g. a `fill` with no `value`) is caught, recorded, and fed
+  back to the model as history for the next turn, instead of being
+  mechanically retried against an artifact-declared recovery table --
+  there is no artifact yet for one to exist in, and unlike `ReplayEngine`,
+  discovery has a reasoning model in the loop that can react to a
+  failure. This is bounded by the same `max_steps`/`max_duration_seconds`/
+  loop-detection limits as everything else, so a model that never recovers
+  still terminates.
+- **Hard bounds, all enforced by `DiscoveryEngine` itself, never left to
+  model judgment:** `DiscoveryLimits.max_steps` (loop iteration cap),
+  `max_duration_seconds` (wall-clock cap, checked every turn),
+  `max_total_tokens` (running sum of `LLMResponse.input_tokens +
+  output_tokens`, checked every turn), `max_consecutive_repeats` (default
+  2 -- two identical proposals in a row are tolerated and execute
+  normally, a third identical one in a row aborts the run with
+  `LOOP_DETECTED` rather than letting the model spin). "Identical" is a
+  signature over action_type/intent/target/value, deliberately excluding
+  the randomly-generated `Action.id`.
+- **Business-outcome detection is deterministic, not model-reported.**
+  `DiscoveryGoal.known_business_outcomes` reuses `BusinessOutcome` from
+  `artifact/schema.py` unchanged (the same "find something on the
+  surface" concept `ReplayEngine` already uses) and is checked against
+  the live surface at the top of every turn, before the model is ever
+  consulted -- exactly mirroring how replay's own business-outcome
+  detection never asks anyone, it just checks.
+- **The model's "done" claim is not trusted outright either.**
+  `DiscoveryGoal.success_checkpoint` (optional; reuses `WaitCondition`) is
+  verified against the live surface when the model declares `done=true`.
+  If it's declared and doesn't verify, the claim is rejected (logged,
+  loop continues, still bounded by the same limits) rather than ending the
+  run on the model's word. If no `success_checkpoint` is declared at all
+  (a goal with nothing yet to check against), `done=true` is accepted as
+  given -- safe, because "the goal was accomplished" isn't itself a safety
+  decision; the `PolicyEngine`, already checked on every action along the
+  way, is what actually keeps discovery from doing anything consequential.
+- **Trace vs. artifact, kept strictly separate (`.CLAUDE/08` decision
+  #6).** `DiscoveryTraceStore` persists a `DiscoveryTrace` --
+  `step_index`, redacted observation/model-output/parsed-action, policy
+  decision, execution error, outcome, for *every* turn including failed
+  detours, malformed output, and loop/limit aborts. Nothing in this phase
+  (or planned for it) ever constructs an `Artifact` from a
+  `DiscoveryTrace` -- that's explicitly Phase 9's job, working from a
+  successful trace after the fact.
+- **Redaction, at every boundary a raw sensitive value could otherwise
+  leak through.** `DiscoveryGoal.sensitive_inputs`/`sensitive_values()`
+  name which of `inputs`' raw values must never be persisted or logged
+  (discovery has no artifact `InputSpec.sensitive` table yet to carry this
+  instead). Two new general-purpose redaction helpers in
+  `observability/redaction.py`: `redact_dict` (a dict of named values,
+  generalizing `redact_inputs` without requiring an `Artifact`) and
+  `redact_text` (freeform substring replacement for prompts/responses/
+  observations, which are unstructured text, not named fields).
+  `DiscoveryEngine` applies one of these (or the engine-local
+  `_redact_json`, a recursive version for nested dict/list structures like
+  a parsed `Action`'s own JSON) to every free-text field before it reaches
+  a `DiscoveryTraceStep`, a `RunEvent`, or a `DiscoveryResult` returned to
+  a caller -- including the goal's own `description` (which commonly
+  embeds the very input it describes, e.g. "Find member M1001...") and
+  both the `url` and `visible_text` of any persisted `Observation`, since
+  the demo app's real URLs embed the member ID verbatim after a redirect
+  (`/members/M1001/accounts`) -- a genuine, non-hypothetical requirement,
+  not just a hypothetical one. Crucially, this redaction is a boundary,
+  not a blanket rule: the *raw* values legitimately reach
+  `AnthropicLLMClient` (the model needs the real member ID to type it into
+  a search box -- that is the system doing its job, not a leak) via an
+  internal, never-persisted `history` list; `DiscoveryEngine._redact_history`
+  is the one place that list is redacted before being handed back in a
+  `DiscoveryResult`.
+- **`AnthropicLLMClient` is thin and provider-isolated.** It is the only
+  module in the codebase importing `anthropic`, imported lazily inside
+  `__init__` rather than at module scope, so nothing else -- including
+  every non-`live_llm` test -- needs the package installed or a key
+  present. Its tool schema deliberately offers a narrower action surface
+  than the full `ActionType` enum (`navigate`/`click`/`fill`/`read`/
+  `dismiss`, and two locator strategies, `role_name`/`css`) -- the model
+  is never offered `wait_for` (no artifact-declared checkpoint for it to
+  describe) as an option to propose in the first place, rather than
+  something `DiscoveryEngine` has to reject after the fact. Verified
+  structurally accurate against the real, installed `anthropic==1.5.0`
+  SDK (via `inspect.signature`/`model_fields` introspection -- confirmed a
+  genuine, newer-than-training-data version of the official package, not
+  a mock) without making any live API call.
+- `tests/fixtures/fake_llm_client.py` (`FakeLLMClient` + `propose`/
+  `propose_done`/`malformed`/`role_target`/`css_target` helpers) is
+  `fake_surface.py`'s sibling on the model side -- a scripted queue of
+  `LLMResponse`s, no network, no key. `fake_surface.py` gained
+  `script_observation` (a queued sequence of `Observation`s) since,
+  unlike `ReplayEngine`, `DiscoveryEngine` calls `observe()` repeatedly
+  between actions and tests need to control what a multi-turn scripted
+  run "sees" at each step.
+- `tests/unit/test_discovery_engine.py`: 11 tests covering every scenario
+  requested -- normal successful discovery (plus proving redaction of the
+  returned history), malformed model output (both "no proposal at all"
+  and "a proposal missing a field its own action_type requires" --
+  the latter surfaces as a *recoverable* execution failure, not
+  `MALFORMED_MODEL_OUTPUT`, since the JSON itself was structurally valid;
+  documented in the test), repeated/looping actions, policy `BLOCKED`,
+  `APPROVAL_REQUIRED`, a model-proposed nonexistent target (proving the
+  failure is fed back as history and the *next* model call actually sees
+  it), maximum-step exhaustion, business-outcome detection without ever
+  invoking the (fake) model, evidence captured on a genuine execution
+  failure but never on a policy escalation, and discovery-trace
+  persistence with a redaction assertion against the full serialized
+  trace. `tests/unit/test_discovery_trace_store.py`: 3 tests for
+  `FileDiscoveryTraceStore`/`NullDiscoveryTraceStore` storage mechanics in
+  isolation, mirroring `test_evidence_store.py`'s pattern.
+- `tests/integration/test_discovery_engine_e2e.py`: 2 real end-to-end
+  tests running the exact `DiscoveryEngine` through a real
+  `PlaywrightSurfaceAdapter` against the real demo app, with
+  `FakeLLMClient` standing in for an actual model (no `ANTHROPIC_API_KEY`
+  needed). Unlike `test_replay_engine_e2e.py`, discovery has no
+  artifact-declared `recoverable_conditions` to mechanically dismiss the
+  real session-notice popup -- the first scripted proposal in both tests
+  is dismissing that popup, proving it's genuinely the model's
+  responsibility here, not the engine's. Covers the real success path
+  (with `success_checkpoint` verification against the real "Accounts"
+  panel) and the real `MEMBER_NOT_FOUND` business outcome.
+- `tests/unit/test_anthropic_llm_client.py`: one `live_llm`-marked test,
+  skips cleanly with no `ANTHROPIC_API_KEY` set (never executed this
+  session, per the standing instruction to only pause on discovery work
+  when a *live* run genuinely needs the key -- this phase never did).
+- `data/discovery_traces/` added to `.gitignore` alongside
+  `data/evidence/`/`data/logs/` -- a discovery trace is redacted but is
+  still real runtime output of real runs, not a reviewable/versioned
+  artifact like `data/artifacts/`.
+- Verified via the cloud-sandbox round-trip (`pytest -m "not live_llm"`):
+  92 tests pass total (81 unit, incl. the 14 new discovery/trace-store
+  tests, + 11 integration, incl. the 2 new discovery e2e tests), no
+  regressions. On-device unit suite reconfirmed green separately (81
+  passed, 12 deselected for `integration`/`live_llm`) before committing;
+  the new `live_llm`-marked Anthropic test skips cleanly with no key set.

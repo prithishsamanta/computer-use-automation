@@ -28,6 +28,13 @@ class EventType(str, Enum):
     STEP_FAILED = "step_failed"
     EVIDENCE_CAPTURED = "evidence_captured"
     RUN_COMPLETED = "run_completed"
+    # Phase 8 (discovery) additions -- same vocabulary, a different
+    # component ("discovery_engine") emits these. RUN_STARTED/
+    # POLICY_CHECKED/ACTION_EXECUTED/BUSINESS_OUTCOME_DETECTED/STEP_FAILED/
+    # EVIDENCE_CAPTURED/RUN_COMPLETED are all reused as-is; these two have
+    # no replay analogue.
+    LLM_ACTION_PROPOSED = "llm_action_proposed"
+    MALFORMED_MODEL_OUTPUT = "malformed_model_output"
 
 
 class RunEvent(BaseModel):

@@ -1,11 +1,15 @@
 """Application settings, read from the environment.
 
-Kept intentionally small. Later phases add ANTHROPIC_API_KEY (discovery)
-and DATABASE_URL (run/capability/intervention state). log_dir/evidence_dir
-(Phase 7) are the file-backed roots for structured events
-(JsonlEventSink) and failure evidence (FileEvidenceStore) respectively --
-both plain directories on disk, no external logging/tracing/evidence
-service. Nothing here is a secret that should ever be logged -- see
+Kept intentionally small. DATABASE_URL (run/capability/intervention state)
+is still to come. log_dir/evidence_dir (Phase 7) are the file-backed roots
+for structured events (JsonlEventSink) and failure evidence
+(FileEvidenceStore); discovery_trace_dir (Phase 8) is the file-backed root
+for complete raw discovery traces (FileDiscoveryTraceStore) -- all plain
+directories on disk, no external logging/tracing/evidence service.
+anthropic_api_key is read from ANTHROPIC_API_KEY when present but is never
+required for normal development or CI -- only AnthropicLLMClient
+(discovery/anthropic_client.py) needs it, and only for an actual live run.
+Nothing here is a secret that should ever be logged -- see
 .CLAUDE/06_ERRORS_AND_OBSERVABILITY.md on redaction discipline.
 """
 
@@ -22,6 +26,8 @@ class Settings(BaseSettings):
     artifact_dir: str = "data/artifacts"
     log_dir: str = "data/logs"
     evidence_dir: str = "data/evidence"
+    discovery_trace_dir: str = "data/discovery_traces"
+    anthropic_api_key: str | None = None
 
 
 def get_settings() -> Settings:

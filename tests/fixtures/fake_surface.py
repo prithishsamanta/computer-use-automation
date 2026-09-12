@@ -41,6 +41,7 @@ class FakeSurfaceAdapter(SurfaceAdapter):
         self._wait: dict[str, list[Exception | None]] = {}
         self._read: dict[str, list[Exception | str]] = {}
         self._evidence: Evidence | None = None
+        self._observations: list[Observation] = []
 
     def script_click(self, target: Target, *results: Exception | None) -> None:
         self._click[_target_key(target)] = list(results)
@@ -61,6 +62,18 @@ class FakeSurfaceAdapter(SurfaceAdapter):
         are covered directly in tests/unit/test_evidence_store.py)."""
         self._evidence = evidence
 
+    def script_observation(self, *observations: Observation) -> None:
+        """Queues what observe() returns, in order -- added for
+        DiscoveryEngine tests, which (unlike ReplayEngine) call observe()
+        repeatedly between actions and need to walk a scripted sequence of
+        pages (e.g. search form -> results -> member detail) rather than
+        the single implicit `url`/empty-text observation replay tests
+        never needed to control. Once the queue is exhausted, observe()
+        falls back to its original behavior (the current `self.url` with
+        empty visible_text) so a test only scripts the observations it
+        actually cares about."""
+        self._observations.extend(observations)
+
     def _pop(self, scripts: dict[str, list], key: str, default: Any) -> Any:
         queue = scripts.get(key)
         if not queue:
@@ -76,6 +89,10 @@ class FakeSurfaceAdapter(SurfaceAdapter):
 
     async def observe(self) -> Observation:
         self.calls.append(("observe",))
+        if self._observations:
+            observation = self._observations.pop(0)
+            self.url = observation.url
+            return observation
         return Observation(url=self.url, visible_text="")
 
     async def click(self, target: Target, *, timeout_ms: int | None = None) -> None:

@@ -14,5 +14,9 @@ data/*.sqlite3
 # artifacts); these are not.
 data/evidence/
 data/logs/
+# Discovery traces are redacted but are still runtime output of real
+# discovery runs (unlike data/artifacts/, which is reviewable and
+# versioned on purpose) -- not committed, same as evidence/logs.
+data/discovery_traces/
 .DS_Store
 node_modules/
