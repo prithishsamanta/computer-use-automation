@@ -1,0 +1,13 @@
+{
+  "capability_id": "close_member_account",
+  "name": "Close Member Account",
+  "description": "Close a member's account after operator approval.",
+  "vendor": "meridian-demo",
+  "application": "credit-union-admin",
+  "supported_versions": [
+    "1.x"
+  ],
+  "tenant_scope": "base",
+  "artifact_version": "1.0.0",
+  "status": "active"
+}

@@ -1,0 +1,91 @@
+{
+  "capability_id": "close_member_account",
+  "name": "Close Member Account",
+  "description": "Open the two-step close-account confirmation for a member's account and, after operator approval, close it. Deliberately built to pause with APPROVAL_REQUIRED at the irreversible step (.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md's own close_account example) so Phase 13's noVNC same-session handoff has a real, non-synthetic scenario to exercise.",
+  "version": "1.0.0",
+  "application": {
+    "vendor": "meridian-demo",
+    "application": "credit-union-admin",
+    "supported_versions": [
+      "1.x"
+    ]
+  },
+  "tenant_scope": "base",
+  "inputs": {},
+  "outputs": {
+    "account_status": {
+      "type": "string",
+      "source": {
+        "primary": {
+          "strategy": "css",
+          "params": {
+            "selector": "#acct-row-1 td:nth-child(4)"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      },
+      "required": true
+    }
+  },
+  "steps": [
+    {
+      "id": "open_close_confirmation",
+      "action_type": "navigate",
+      "intent": "view_account",
+      "target": null,
+      "value": "http://demo-app:8080/members/M1001/accounts/A-5001/close-confirm",
+      "risk": "safe",
+      "wait": {
+        "timeout_ms": 5000
+      },
+      "checkpoint": {
+        "kind": "text_present",
+        "target": null,
+        "text": "This cannot be undone.",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "confirm_close",
+      "action_type": "click",
+      "intent": "close_account",
+      "target": {
+        "primary": {
+          "strategy": "role_name",
+          "params": {
+            "role": "button",
+            "name": "Confirm Close"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      },
+      "value": null,
+      "risk": "safe",
+      "wait": {
+        "timeout_ms": 5000
+      },
+      "checkpoint": {
+        "kind": "text_present",
+        "target": null,
+        "text": "Closed",
+        "timeout_ms": 5000
+      }
+    }
+  ],
+  "success_condition": {
+    "type": "output_valid",
+    "output": "account_status"
+  },
+  "business_outcomes": [],
+  "recoverable_conditions": [],
+  "safety": {
+    "intent": "close_account",
+    "risk": "approval_required"
+  },
+  "provenance": {
+    "created_from_run": "manual-authoring-phase13-verification",
+    "created_at": "2026-09-13T05:49:52.426016Z"
+  }
+}
