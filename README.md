@@ -79,7 +79,8 @@ capabilities, logs, evidence, discovery traces, interventions) is a bind
 mount, so it persists across `docker compose up` / `down` cycles and is
 inspectable directly on the host.
 
-**Verification status:** confirmed on the developer's real Mac.
+**Verification status: fully verified on the developer's real Mac,**
+both the build/startup path and the noVNC same-session handoff itself.
 `docker compose build` completed successfully, both services started,
 `GET http://localhost:8000/health` returned 200, Xvfb/x11vnc/noVNC all
 started correctly inside the `automation` container, and the Compose
@@ -91,12 +92,41 @@ why this verification could only happen on the developer's own machine,
 not from the tool session that wrote the config), but it no longer means
 "untested"; it was tested, on the actual target machine.
 
-Still being manually confirmed: the noVNC same-session intervention/
-resume flow specifically -- steps 4-9 below (trigger a run to
-intervention, watch the paused browser over noVNC, claim it, manipulate
-it, and confirm resume continues the same run/session on the same
-browser). Startup/health/network are verified; that flow is the next
-thing being checked, and Phase 14 is on hold until it is.
+The noVNC same-session intervention/resume flow (steps 4-9 below) has
+also now been manually run end to end, twice, against two different
+escalation paths, both through the real Dockerized API:
+
+- **Approval-required, then automation performs the approved action.**
+  `close_member_account` on member `M1001` / account `A-5001` paused at
+  the policy-gated `close_account` step
+  (`run_id 92c86535dca14af0aa14f9e2d8f5942f`,
+  `intervention_id cb2396bae1b74d6abab7b13095ba69cc`). The browser stayed
+  open on the close-confirmation page, visible in noVNC; claim -> (the
+  operator deliberately did *not* click the button themselves, since the
+  resume mechanism re-executes the gated step) -> complete -> resume
+  continued the *same* `run_id`, automation clicked "Confirm Close"
+  itself, and the run finished `success` with
+  `{"account_status": "Closed"}`.
+- **Hard failure, human resolves the ambiguity via noVNC, automation
+  re-validates.** `get_savings_balance` on `member_id="Smith"` (matches
+  two seeded members) failed a checkpoint mid-replay
+  (`run_id 720f35e5933645f3920ae893b3f1bb64`, `error_code
+  CHECKPOINT_FAILED`, `intervention_id d40a68d8004d49b0a898b893f139a93f`)
+  and paused with a real captured screenshot/DOM snapshot
+  (`data/evidence/720f35e5933645f3920ae893b3f1bb64/`). The operator
+  claimed it, used noVNC to drive the *same* live browser to the correct
+  member (M1002) themselves -- a genuinely different resolution path than
+  the approval case above, since here the human, not automation, resolves
+  the ambiguous state -- then completed and resumed. The *same* `run_id`
+  finished `success` with `savings_balance: 9900.00` (M1002's real seeded
+  balance), read from wherever the human left the browser.
+
+Both runs prove the same underlying guarantee from two different angles:
+the original `run_id`/`session_id` are preserved end to end, the browser
+session is never recreated, and `RunOrchestrator` correctly resumes
+either by re-executing a specific approved step or (when no single step
+is known-safe to retry, e.g. any `FAILED` outcome) by skipping straight to
+output re-extraction against whatever state the operator left the page in.
 
 ### Manual verification checklist (Phase 13: live-session handoff via noVNC)
 

@@ -1326,7 +1326,55 @@ Default branch: `main`.
   checklist steps 4-9 -- trigger a run to intervention, watch/claim/
   manipulate the paused browser over noVNC, resume, confirm it continues
   the same run/session). The user is running that check next; Phase 14
-  does not start until they confirm it.
+  does not start until they confirm it. (Superseded below: the user has
+  since run this flow for real, twice.)
+
+- **Update -- the noVNC same-session handoff flow itself is now
+  confirmed, on the user's actual Mac, via the real Dockerized API path
+  (not this tool's own out-of-Docker verification round-trips above):**
+  two independent escalation scenarios, both preserving the original
+  `run_id`/`session_id` end to end.
+
+  1. **Approval-required.** `close_member_account` (M1001/A-5001) paused
+     at the policy-gated `close_account` click
+     (`run_id 92c86535dca14af0aa14f9e2d8f5942f`,
+     `intervention_id cb2396bae1b74d6abab7b13095ba69cc`,
+     `session_id c896ebe1b323405aae0f08539bb4b817`). The browser stayed
+     open on the close-confirmation page, visible over noVNC; the
+     operator deliberately did not click the gated button themselves
+     (doing so would leave nothing for the resumed step to click --
+     ReplayEngine re-executes the exact step it paused at for an
+     `APPROVAL_REQUIRED` escalation). Claim -> complete -> resume: the
+     same `run_id` finished `success`, and *automation itself* performed
+     the click, producing `{"account_status": "Closed"}`.
+  2. **Hard failure, human resolves via noVNC.** `get_savings_balance`
+     with `member_id="Smith"` (ambiguous -- matches two seeded members)
+     failed the `submit_search` checkpoint
+     (`run_id 720f35e5933645f3920ae893b3f1bb64`, `error_code
+     CHECKPOINT_FAILED`, `intervention_id
+     d40a68d8004d49b0a898b893f139a93f`, `session_id
+     07e576a073e446fcad356a2a05a44f6f`), and a real screenshot + DOM
+     snapshot were captured to
+     `data/evidence/720f35e5933645f3920ae893b3f1bb64/`. Here the operator
+     *did* act in the browser via noVNC -- navigating the same live
+     session to the correct member (M1002) themselves, since a
+     checkpoint failure (unlike an approval gate) has no single "the
+     human just approved this" step for automation to safely re-execute.
+     Claim -> complete -> resume: `ReplayEngine.RESUME_AFTER_ALL_STEPS`
+     (every `FAILED` result resumes this way, regardless of which step
+     failed -- see `replay/engine.py`'s own docstring) skipped straight
+     to output re-extraction against wherever the operator left the
+     page, and the same `run_id` finished `success` with
+     `savings_balance: 9900.00` -- M1002's real seeded savings balance,
+     confirming the read came from the human-navigated page, not a
+     coincidence.
+
+  Together these two runs exercise both of `RunOrchestrator`'s resume
+  branches (`resume_from_step_id` pointing at one specific step vs.
+  `RESUME_AFTER_ALL_STEPS`) against the real API, real Docker, and real
+  noVNC control -- not a test double anywhere. README.md and
+  docker-compose.yml's top comment have been updated to state this as
+  verified, not pending. Phase 14 is unblocked.
 
 ### Bugfix (during Phase 14 evidence capture) — `get_savings_balance` failed through the real orchestrator/API
 

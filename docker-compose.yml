@@ -3,13 +3,16 @@
 # NOTE ON VERIFICATION: this file is authored and reasoned about from a
 # sandboxed environment with no Docker CLI/socket access, so
 # `docker compose build` / `up` can only ever be run and verified from
-# the developer's actual Mac, not from that sandbox. That has now
-# happened for the Phase 13 Xvfb/x11vnc/noVNC additions below: build
+# the developer's actual Mac, not from that sandbox. That has now fully
+# happened, including the Phase 13 Xvfb/x11vnc/noVNC additions: build
 # completed, both services started, automation's /health returned 200,
-# Xvfb/x11vnc/noVNC all started correctly, and the automation<->demo-app
-# Compose network works. See README.md's Docker section for the full
-# verification status and the manual noVNC handoff checklist (still being
-# run as of this note).
+# Xvfb/x11vnc/noVNC all started correctly, the automation<->demo-app
+# Compose network works, AND the noVNC same-session intervention/resume
+# flow itself has been run end to end twice for real (an approval-required
+# escalation and a hard-failure escalation, both preserving the original
+# run_id/session_id across pause -> claim -> human action via noVNC ->
+# complete -> resume). See README.md's Docker section for the full
+# verification status and results.
 #
 # Phase 2: demo-app (the legacy credit-union admin UI) + automation
 # (FastAPI). Phase 13 adds Xvfb/x11vnc/noVNC to `automation` so an
