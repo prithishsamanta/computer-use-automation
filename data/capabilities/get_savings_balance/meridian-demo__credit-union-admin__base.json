@@ -8,6 +8,6 @@
     "1.x"
   ],
   "tenant_scope": "base",
-  "artifact_version": "1.0.0",
+  "artifact_version": "1.0.1",
   "status": "active"
 }

@@ -1327,3 +1327,89 @@ Default branch: `main`.
   manipulate the paused browser over noVNC, resume, confirm it continues
   the same run/session). The user is running that check next; Phase 14
   does not start until they confirm it.
+
+### Bugfix (during Phase 14 evidence capture) — `get_savings_balance` failed through the real orchestrator/API
+
+**Symptom, reported by the user from the real Docker container:** `POST
+/runs` for `get_savings_balance` with `member_id="M1001"` and with
+`member_id="no-such-member"` both returned `FAILED` /
+`TARGET_NOT_FOUND`, `"Could not resolve target for fill: tried 1
+candidate(s)"` — both should have been `SUCCESS` / `BUSINESS_OUTCOME`
+respectively.
+
+**Root cause.** `RunOrchestrator._run_replay` acquires a brand-new
+Playwright surface for every non-resumed run (`cm =
+self._surface_factory(); surface = await cm.__aenter__()`, then straight
+into `ReplayEngine.run()` — see orchestration/orchestrator.py) with
+nothing in between that navigates it anywhere, so the surface starts on
+`about:blank`. `get_savings_balance()` (tests/fixtures/sample_artifacts.py)
+has no `NAVIGATE` step of its own — its first step (`fill_member_id`)
+assumes the surface is already sitting on the demo app's search page, a
+bare `role=textbox` locator with no fallback. That assumption was true in
+every place this fixture had ever been exercised before: every
+`ReplayEngine`-direct test (`tests/integration/test_replay_engine_e2e.py`)
+navigates the surface itself before calling `engine.run()`, and every
+`RunOrchestrator` unit test (`tests/unit/test_run_orchestrator.py`) uses
+`FakeSurfaceAdapter`, which has no notion of page state at all — so
+nothing had ever exercised this fixture through `RunOrchestrator`'s real,
+freshly-acquired surface. `close_member_account` (Phase 13's registered
+capability) never hit this because it was authored *with* its own leading
+`NAVIGATE` step from the start.
+
+This is not a locator bug (`role=textbox` correctly matches the demo
+app's one search box, once the surface is actually on that page) and not
+an orchestrator defect in the sense of "should navigate but doesn't" —
+`RunOrchestrator`/`RunRequest` have no field anywhere carrying a generic
+per-capability "start URL" for an already-resolved capability (that
+concept exists only on `DiscoveryGoal.start_url`, for *new* capabilities
+being discovered), so there is no other place in the current architecture
+a start point could come from except the artifact's own steps.
+
+**Fix.** The shared, already-tested fixture in
+`tests/fixtures/sample_artifacts.py` is untouched — it's reused by ~15
+unit tests and 4 integration tests with differing base URLs per
+environment (pytest's `demo_app_base_url` uses a fresh ephemeral port
+every run; the real container uses the fixed Compose hostname
+`http://demo-app:8080`), which is exactly why it never had its own
+navigation step. `scripts/register_get_savings_balance_capability.py` now
+builds a small deployment-scoped variant instead: the fixture's exact,
+unmodified steps/outputs/success_condition/business_outcomes/
+recoverable_conditions, with one additional leading `NAVIGATE` step
+(`open_search_page`, intent `search_member` — `ALLOW` in
+`DEFAULT_GLOBAL_INTENT_POLICY`, own checkpoint) pointing at
+`http://demo-app:8080/` — the same self-contained-navigation pattern
+`close_member_account` already used, built through the real `Artifact()`
+constructor (full pydantic validation) rather than an unvalidated
+`model_copy`. Registered as version `1.0.1` (`1.0.0` — the broken
+registration — stays on disk untouched; `FileArtifactRepository.save()`
+deliberately refuses to overwrite a published version, so this is the
+same monotonic-patch-bump convention `RunOrchestrator._next_version` uses
+elsewhere); the capability record was repointed at `1.0.1` (an ordinary,
+idempotent metadata update, by design).
+
+**Regression test added:** `tests/integration/test_run_orchestrator_e2e.py`
+— three `@pytest.mark.integration` tests, the first of their kind to
+exercise the real `RunOrchestrator` + real `launch_playwright_surface` +
+real demo app together (everything else either fakes the surface or
+bypasses `RunOrchestrator`): `M1001` → `SUCCESS`, `savings_balance ==
+Decimal("18204.55")`; `no-such-member` → `BUSINESS_OUTCOME`,
+`MEMBER_NOT_FOUND`; `Smith` (ambiguous — matches two seeded members) →
+`FAILED` with a real `intervention_id`/`session_id`, then
+`cancel_intervention` to clean up the paused session. Each test registers
+its own deployment-scoped artifact variant (same construction as the
+registration script, pointed at the test's own ephemeral
+`demo_app_base_url` instead of the Compose hostname) into `tmp_path`-backed
+repositories — no shared/global state, no change to `data/`.
+
+**Verified:** all 3 new tests pass against a real browser (cloud-sandbox
+round-trip, §5 — no Docker in that sandbox, so this is the same
+extra-diligence pattern used before, not equivalent to the user's own
+Docker verification). Full suite re-run `-m "not live_llm"`: 181 passed
+(178 previously-passing + 3 new), 1 deselected (`live_llm`), zero
+failures, zero regressions. `close_member_account` was not touched —
+its own real run (`run_id` `92c86535dca14af0aa14f9e2d8f5942f`) already
+proved it correct, and this bug never applied to it.
+
+**Not changed:** the artifact schema, `ReplayEngine`, `RunOrchestrator`,
+`LayeredPolicyEngine`, any locator, or `tests/fixtures/sample_artifacts.py`
+itself.

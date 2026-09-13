@@ -1,0 +1,169 @@
+{
+  "capability_id": "get_savings_balance",
+  "name": "Get Savings Balance",
+  "description": "Find a member by ID and return their current savings balance.",
+  "version": "1.0.1",
+  "application": {
+    "vendor": "meridian-demo",
+    "application": "credit-union-admin",
+    "supported_versions": [
+      "1.x"
+    ]
+  },
+  "tenant_scope": "base",
+  "inputs": {
+    "member_id": {
+      "type": "string",
+      "required": true,
+      "description": "Institution member identifier",
+      "sensitive": true
+    }
+  },
+  "outputs": {
+    "savings_balance": {
+      "type": "decimal",
+      "source": {
+        "primary": {
+          "strategy": "css",
+          "params": {
+            "selector": "#acct-row-2 td:nth-child(3)"
+          },
+          "frame": "#accounts-frame"
+        },
+        "fallbacks": [
+          {
+            "strategy": "css",
+            "params": {
+              "selector": "#tbl1 tr:nth-child(3) td:nth-child(3)"
+            },
+            "frame": "#accounts-frame"
+          }
+        ]
+      },
+      "required": true
+    }
+  },
+  "steps": [
+    {
+      "id": "open_search_page",
+      "action_type": "navigate",
+      "intent": "search_member",
+      "target": null,
+      "value": "http://demo-app:8080/",
+      "risk": "safe",
+      "wait": {
+        "timeout_ms": 5000
+      },
+      "checkpoint": {
+        "kind": "text_present",
+        "target": null,
+        "text": "Member ID or Last Name",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "fill_member_id",
+      "action_type": "fill",
+      "intent": "enter_member_id",
+      "target": {
+        "primary": {
+          "strategy": "role_name",
+          "params": {
+            "role": "textbox"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      },
+      "value": "{{member_id}}",
+      "risk": "safe",
+      "wait": {
+        "timeout_ms": 5000
+      },
+      "checkpoint": null
+    },
+    {
+      "id": "submit_search",
+      "action_type": "click",
+      "intent": "submit_member_search",
+      "target": {
+        "primary": {
+          "strategy": "role_name",
+          "params": {
+            "role": "button",
+            "name": "Search"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      },
+      "value": null,
+      "risk": "safe",
+      "wait": {
+        "timeout_ms": 5000
+      },
+      "checkpoint": {
+        "kind": "text_present",
+        "target": null,
+        "text": "Accounts",
+        "timeout_ms": 5000
+      }
+    }
+  ],
+  "success_condition": {
+    "type": "output_valid",
+    "output": "savings_balance"
+  },
+  "business_outcomes": [
+    {
+      "code": "MEMBER_NOT_FOUND",
+      "detect": {
+        "kind": "text_present",
+        "target": null,
+        "text": "Member not found.",
+        "timeout_ms": 5000
+      }
+    }
+  ],
+  "recoverable_conditions": [
+    {
+      "code": "SESSION_NOTICE_POPUP",
+      "detect": {
+        "kind": "visible",
+        "target": {
+          "primary": {
+            "strategy": "role_name",
+            "params": {
+              "role": "button",
+              "name": "OK"
+            },
+            "frame": null
+          },
+          "fallbacks": []
+        },
+        "text": null,
+        "timeout_ms": 5000
+      },
+      "recovery": "dismiss",
+      "dismiss_target": {
+        "primary": {
+          "strategy": "role_name",
+          "params": {
+            "role": "button",
+            "name": "OK"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      }
+    }
+  ],
+  "safety": {
+    "intent": "view_savings_balance",
+    "risk": "safe"
+  },
+  "provenance": {
+    "created_from_run": "manual-authoring-phase4",
+    "created_at": "2026-09-13T20:25:22.249375Z"
+  }
+}
