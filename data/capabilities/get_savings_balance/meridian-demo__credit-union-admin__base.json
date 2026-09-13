@@ -1,0 +1,13 @@
+{
+  "capability_id": "get_savings_balance",
+  "name": "Get Savings Balance",
+  "description": "Find a member by ID and return their current savings balance.",
+  "vendor": "meridian-demo",
+  "application": "credit-union-admin",
+  "supported_versions": [
+    "1.x"
+  ],
+  "tenant_scope": "base",
+  "artifact_version": "1.0.0",
+  "status": "active"
+}
