@@ -1558,3 +1558,158 @@ round-trip (§5) — all 4 pass, including the now-unmasked
 fresh-surface-replay assertion. No Anthropic call was made; this entire
 fix and its verification used `FakeLLMClient` only, per instruction —
 this is a pipeline-correctness fix, not evidence of live LLM usage.
+
+
+### Bugfix (first genuine Anthropic-backed discovery run) — "done" could be accepted with nothing materializable behind it
+
+**Symptom (real Anthropic call, run `d17d9a2fd9a8483c9ca278976f1cf520`,
+capability `discover_savings_balance_demo`):** the model correctly
+observed the Savings account (`A-5002`, balance `$18204.55`) already
+rendered on the page, and its first and only response was
+`{"reasoning": "...the task is complete.", "done": true}` -- zero
+proposed actions. `DiscoveryEngine` accepted this immediately (no
+`success_checkpoint` was declared for this goal, so
+`_verify_success_checkpoint` trivially returned `True`) and reported
+`DiscoveryStatus.SUCCESS` after a single, entirely inert step.
+`ArtifactBuilder.build()` then correctly refused to build anything from
+it: `"trace 'd17d9a2fd9a8483c9ca278976f1cf520' has no executed actions;
+nothing to build an artifact from"` -- an entirely predictable failure,
+just one that should never have been allowed to reach `ArtifactBuilder`
+in the first place. `RunOrchestrator` escalated to a human intervention,
+and the run ultimately reported `failed`. This real run (its log, trace,
+and intervention record) is preserved exactly as captured and was not
+modified for this fix -- it is the evidence that exposed the gap.
+
+Separately, this same run's JSONL log showed **two** identical
+`discovery_engine: run_completed status=success` events 4.5ms apart.
+
+**Root cause:** `DiscoveryEngine` had a `success_checkpoint`-verification
+gate on a "done" claim, but no gate at all on whether discovery had
+produced anything an artifact could actually be built from. Seeing the
+answer already present in `Observation.visible_text` was treated as
+equivalent to having *obtained* it through a replayable action, which it
+is not -- `Observation.visible_text` is a debugging/model-context aid
+(and, per Phase 8, is not even guaranteed to see inside iframes the way
+`playwright_adapter`'s `page.inner_text("body")` does not), never itself
+part of what gets replayed. The duplicate `run_completed` emission was a
+second, unrelated bug in the same code path: the success/"done" branch had
+its own inline `self._emit(..., EventType.RUN_COMPLETED, ...)` call, in
+addition to the trailing, unconditional `self._emit(..., RUN_COMPLETED,
+...)` every terminal branch already receives at the bottom of `run()`
+(confirmed by reading `_finish()` and every other terminal branch --
+`BUSINESS_OUTCOME`, `MALFORMED_MODEL_OUTPUT`, `LOOP_DETECTED`,
+`MAX_STEPS_EXCEEDED`, `MAX_DURATION_EXCEEDED`, `MAX_TOKENS_EXCEEDED` --
+none of which had this redundant second emit). Genuine duplicate
+emission, not intentional layering.
+
+**The invariant chosen:** `DiscoveryEngine._has_materializable_progress`
+-- a "done" claim is only trusted once `history` contains at least one
+entry with `outcome == "executed"` and `action.action_type ==
+ActionType.READ`. This is the exact same requirement
+`ArtifactBuilder.build()` already enforces completely independently and
+unconditionally downstream: `_build_outputs` turns only executed READ
+actions into a declared `OutputSpec`, and `build()` raises
+`ArtifactBuildError` if `outputs` ends up empty, for *any* trace,
+regardless of what the goal was for (confirmed: `build()` also requires
+`trace.final_status == "success"` before it will even look at a trace at
+all, and `DiscoveryStatus.SUCCESS` is assigned in exactly one place in
+`engine.py`, gated by this same check -- there is no second path into
+"success" that could bypass it, and no path from discovery's "success"
+into `ArtifactBuilder` that doesn't first require that same status).
+Deliberately narrower than "any executed action at all": an executed
+click or fill unrelated to the goal must not count as progress just
+because *something* happened, or a workflow could satisfy this
+accidentally. READ is not an arbitrary, discovery-only bar picked to make
+this one demo pass -- it is the identical, pre-existing downstream
+requirement, checked earlier so the model gets a chance to correct course
+instead of the whole run ending in a doomed, wasted intervention.
+
+**How a premature `done=true` is handled:** rejected, not treated as a
+terminal failure. The "done" turn's `trace_step` is still appended to
+`trace.steps` (outcome `"declared_done"`, exactly as an unverified
+`success_checkpoint` claim already was) -- the trace keeps recording
+what actually happened -- but no `DiscoveryHistoryEntry` is created for
+it (`DiscoveryHistoryEntry.action` is a required field; a "done" turn
+proposes no action, so it was never representable in `history` before
+this fix either, and still isn't after it), and the loop `continue`s to
+the next turn instead of returning `DiscoveryStatus.SUCCESS`.
+
+**How the corrective feedback is bounded:** by the existing
+`DiscoveryLimits`, with zero new state beyond one boolean
+(`needs_progress_reminder`). Once a "done" is rejected, every subsequent
+call to `propose_action` has `_PROGRESS_REMINDER_TEXT` appended to an
+*ephemeral* `Observation` built just for that call
+(`observation_for_model`); the real `observation` variable, and
+everything derived from it that gets persisted (`trace_step.
+observation_url`/`observation_text_excerpt`), is completely untouched --
+the trace never mixes real page content with injected system text, and
+`ArtifactBuilder` never receives a fabricated action: the model must
+still propose the READ itself, through the same structured
+`action_type`/`target` schema every other turn uses. A model that never
+produces a materializable READ simply keeps consuming turns from the
+same `for step_index in range(limits.max_steps)` loop every other turn
+already draws from, and falls through to the existing
+`DiscoveryStatus.MAX_STEPS_EXCEEDED` branch once they run out -- no
+separate retry budget, no new limit, no new `DiscoveryStatus` value
+(`DiscoveryStatus.FAILED` remains declared but unused; it was not needed
+here either).
+
+**Duplicate `run_completed` fix:** removed the one redundant inline
+`self._emit(run_id, EventType.RUN_COMPLETED, status="success", ...)`
+call from the success branch. The trailing unconditional emit at the end
+of `run()` already covers this branch like every other; nothing else
+changed.
+
+**Deliberately not done:** no change to the demo goal/capability
+definition (the fix is structural, in `DiscoveryEngine`, not a prompt
+tweak to make this one goal say "use a READ action"); no fabrication of
+an action from the model's reasoning text anywhere (`ArtifactBuilder` was
+not touched by this fix at all -- it was already correct, per the
+previous bugfix entry above); no change to `Observation`,
+`DiscoveryHistoryEntry`, or the `LLMClient` interface (the corrective
+text rides on a call-scoped `Observation` copy, never a schema change);
+no modification to the preserved real run's log, trace, or intervention
+record (`d17d9a2fd9a8483c9ca278976f1cf520`) -- it remains exactly as
+captured, as the evidence that exposed this gap.
+
+**Regression tests added (`tests/unit/test_discovery_engine.py`):**
+`test_done_with_no_executed_action_does_not_succeed_immediately`,
+`test_repeatedly_declaring_done_without_progress_is_bounded_not_unbounded`,
+`test_rejected_done_feeds_back_corrective_context_and_accepts_a_read`,
+`test_done_after_a_materializable_read_succeeds`,
+`test_flows_with_materializable_progress_are_unaffected_by_the_new_gate`,
+`test_successful_run_emits_run_completed_exactly_once`. Five pre-existing
+tests in the same file had scripted "done" immediately after only
+fill/click actions, with no READ at all
+(`test_normal_successful_discovery_executes_allowed_actions_and_stops_on_done`,
+`test_action_type_specific_incompleteness_is_a_recoverable_execution_failure`,
+`test_model_proposing_a_nonexistent_target_is_a_recoverable_execution_failure`,
+`test_discovery_trace_is_persisted_separately_from_the_returned_result`,
+`test_execution_failure_captures_evidence_but_policy_escalation_does_not`)
+-- exactly the shape of trace this fix now correctly refuses to call
+successful -- and were updated to execute a READ before their final
+"done", not reverted; their actual subject (loop/policy/error-recovery
+behavior) is otherwise unchanged. One more of the same shape was found in
+`tests/integration/test_discovery_engine_e2e.py`
+(`test_discovery_engine_finds_a_member_and_verifies_its_own_success_claim`)
+and fixed the same way, against the real demo app. A new integration test,
+`tests/integration/test_artifact_builder_e2e.py::
+test_premature_done_is_corrected_then_artifact_replays_with_a_different_input`,
+proves the full corrective loop end to end against a real browser: a
+premature `done=true` on turn 0 is rejected, the model dismisses the
+popup/searches/READs the balance, a second `done=true` is accepted, the
+resulting artifact is identical in shape to the uncorrected flow's own
+artifact, and it replays successfully with a *different* member id than
+discovery ever used.
+
+**Verified:** `tests/unit/test_discovery_engine.py` (17 tests, all
+passing) + full deterministic suite `-m "not integration and not
+live_llm"` (174 passed, 17 deselected, zero regressions elsewhere) run
+directly against the repo. All integration tests (16, including the two
+touched/added by this fix) were additionally run for real against a live
+browser via the cloud-sandbox round-trip (§5) -- all pass. Combined
+`-m "not live_llm"` run: 190 passed, 1 deselected (the `live_llm` smoke
+test, which needs a real API key and is out of scope here). No Anthropic
+call was made for any of this verification -- `FakeLLMClient` only, per
+instruction. The real run that exposed this
+(`d17d9a2fd9a8483c9ca278976f1cf520`) was not rerun.

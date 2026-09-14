@@ -29,7 +29,7 @@ from cuas.domain import AppContext
 from cuas.safety import LayeredPolicyEngine
 from cuas.surface.adapter import WaitCondition, WaitConditionKind
 from cuas.surface.playwright_adapter import launch_playwright_surface
-from tests.fixtures.fake_llm_client import FakeLLMClient, propose, propose_done, role_target
+from tests.fixtures.fake_llm_client import FakeLLMClient, css_target, propose, propose_done, role_target
 
 pytestmark = pytest.mark.integration
 
@@ -38,17 +38,20 @@ CONTEXT = AppContext(vendor="meridian-demo", application="credit-union-admin", v
 
 @pytest.mark.asyncio
 async def test_discovery_engine_finds_a_member_and_verifies_its_own_success_claim(demo_app_base_url: str) -> None:
-    """Four scripted turns -- dismiss the real popup, fill the real
-    textbox, click the real search button, then declare done -- driven
-    through the exact observe/parse/policy/execute/observe loop against a
-    real browser. The model's "done" is not just trusted: a declared
-    success_checkpoint is verified against the live page before the run
-    is allowed to report SUCCESS."""
+    """Five scripted turns -- dismiss the real popup, fill the real
+    textbox, click the real search button, READ the savings balance, then
+    declare done -- driven through the exact
+    observe/parse/policy/execute/observe loop against a real browser. The
+    model's "done" is not just trusted twice over: a declared
+    success_checkpoint is verified against the live page, and (see
+    DiscoveryEngine._has_materializable_progress) the run must have
+    actually executed a READ, before it is allowed to report SUCCESS."""
 
     llm = FakeLLMClient(
         propose("click", "dismiss_known_popup", target=role_target("button", "OK")),
         propose("fill", "search_member", target=role_target("textbox"), value="M1001"),
         propose("click", "view_account", target=role_target("button", "Search")),
+        propose("read", "open_member_record", target=css_target("#acct-row-2 td:nth-child(3)", frame="#accounts-frame")),
         propose_done("the Accounts panel is now visible"),
     )
 
@@ -66,8 +69,8 @@ async def test_discovery_engine_finds_a_member_and_verifies_its_own_success_clai
         result = await engine.run(goal, CONTEXT)
 
     assert result.status == DiscoveryStatus.SUCCESS
-    assert result.steps_taken == 4
-    assert [entry.outcome for entry in result.history] == ["executed", "executed", "executed"]
+    assert result.steps_taken == 5
+    assert [entry.outcome for entry in result.history] == ["executed", "executed", "executed", "executed"]
     # The raw member id was needed by (fake) "the model", but must not
     # survive into what DiscoveryEngine hands back.
     assert "M1001" not in repr(result.history)

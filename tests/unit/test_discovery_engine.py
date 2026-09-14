@@ -13,7 +13,7 @@ import pytest
 from cuas.discovery.engine import DiscoveryEngine
 from cuas.discovery.models import DiscoveryGoal, DiscoveryLimits, DiscoveryStatus
 from cuas.discovery.trace import FileDiscoveryTraceStore
-from cuas.domain import AppContext, TargetNotFoundError
+from cuas.domain import ActionType, AppContext, TargetNotFoundError
 from cuas.observability import EventType
 from cuas.safety import LayeredPolicyEngine
 from cuas.surface.adapter import Evidence, Observation, WaitCondition, WaitConditionKind
@@ -43,23 +43,26 @@ def _engine(fake: FakeSurfaceAdapter, llm: FakeLLMClient, **kwargs) -> Discovery
 
 @pytest.mark.asyncio
 async def test_normal_successful_discovery_executes_allowed_actions_and_stops_on_done() -> None:
-    """Two SAFE-classified actions (search_member, view_account -- real
-    entries in DEFAULT_GLOBAL_INTENT_POLICY) execute through the fake
-    surface, then the model declares done with no declared
-    success_checkpoint to verify against, so its claim is accepted."""
+    """Three SAFE-classified actions (search_member, view_account x2 --
+    real entries in DEFAULT_GLOBAL_INTENT_POLICY) execute through the fake
+    surface -- including a READ, without which "done" would no longer be
+    accepted at all, see _has_materializable_progress -- then the model
+    declares done with no declared success_checkpoint to verify against,
+    so its claim is accepted."""
 
     fake = FakeSurfaceAdapter()
     llm = FakeLLMClient(
         propose("fill", "search_member", target=role_target("textbox"), value="M1001"),
         propose("click", "view_account", target=role_target("button", "Search")),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
         propose_done("the savings balance is now visible"),
     )
 
     result = await _engine(fake, llm).run(_goal(), CONTEXT)
 
     assert result.status == DiscoveryStatus.SUCCESS
-    assert result.steps_taken == 3
-    assert [call[0] for call in fake.calls if call[0] in ("fill", "click")] == ["fill", "click"]
+    assert result.steps_taken == 4
+    assert [call[0] for call in fake.calls if call[0] in ("fill", "click", "read")] == ["fill", "click", "read"]
     # The raw member id was legitimately sent to "the model" (llm.calls
     # carries what FakeLLMClient was actually invoked with, unredacted --
     # that's correct, the model needs the real value)...
@@ -100,6 +103,7 @@ async def test_action_type_specific_incompleteness_is_a_recoverable_execution_fa
     fake = FakeSurfaceAdapter()
     llm = FakeLLMClient(
         propose("fill", "search_member", target=role_target("textbox")),  # no value
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
         propose_done("recovered"),
     )
 
@@ -185,16 +189,17 @@ async def test_model_proposing_a_nonexistent_target_is_a_recoverable_execution_f
 
     llm = FakeLLMClient(
         propose("click", "search_member", target=bad_target),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
         propose_done("recovered and the balance is visible"),
     )
 
     result = await _engine(fake, llm).run(_goal(), CONTEXT)
 
     assert result.status == DiscoveryStatus.SUCCESS
-    assert result.steps_taken == 2
+    assert result.steps_taken == 3
     assert result.history[0].outcome == "execution_failed"
     assert result.history[0].error_message is not None
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
     # The second call to the model must have seen the first failure as
     # context -- proof the failure was fed back, not silently swallowed.
     assert llm.calls[1][3][0].outcome == "execution_failed"
@@ -250,6 +255,7 @@ async def test_discovery_trace_is_persisted_separately_from_the_returned_result(
     fake = FakeSurfaceAdapter()
     llm = FakeLLMClient(
         propose("fill", "search_member", target=role_target("textbox"), value="M1001"),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
         propose_done("balance visible"),
     )
     trace_store = FileDiscoveryTraceStore(tmp_path)
@@ -262,7 +268,7 @@ async def test_discovery_trace_is_persisted_separately_from_the_returned_result(
     assert loaded.capability_id == "get_savings_balance"
     assert loaded.final_status == "success"
     assert loaded.finished_at is not None
-    assert len(loaded.steps) == 2
+    assert len(loaded.steps) == 3
     assert (tmp_path / f"{result.run_id}.json").exists()
     # The raw sensitive input must never survive into the persisted trace.
     assert "M1001" not in loaded.model_dump_json()
@@ -280,6 +286,7 @@ async def test_execution_failure_captures_evidence_but_policy_escalation_does_no
     sink = InMemoryEventSink()
     llm = FakeLLMClient(
         propose("click", "search_member", target=role_target("button", "Ghost")),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
         propose_done(),
     )
 
@@ -292,3 +299,168 @@ async def test_execution_failure_captures_evidence_but_policy_escalation_does_no
     result2 = await _engine(FakeSurfaceAdapter(), llm2, event_sink=sink2).run(_goal(), CONTEXT)
     assert result2.status == DiscoveryStatus.APPROVAL_REQUIRED
     assert sink2.events_of(EventType.EVIDENCE_CAPTURED) == []
+
+
+
+# ---------------------------------------------------------------------------
+# "Materializable progress" -- a discovery run must not be allowed to
+# report SUCCESS on a "done" claim until it has executed at least one
+# READ, because that is the exact same thing ArtifactBuilder itself
+# already requires to build a reusable artifact at all (see
+# DiscoveryEngine._has_materializable_progress and DECISIONS_LOG.md for
+# the real Anthropic-backed run that first exposed this: the model saw
+# the answer already visible on the page and declared done without ever
+# proposing a READ, producing a trace ArtifactBuilder correctly refused
+# to build anything from).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_done_with_no_executed_action_does_not_succeed_immediately() -> None:
+    """The exact shape of the real bug: the model declares done on its
+    very first turn, having executed nothing at all (the answer was
+    already visible in the observation text). This must not be accepted
+    as SUCCESS -- with no further scripted response and max_steps=1, the
+    run is bounded to a single rejected "done" and MAX_STEPS_EXCEEDED,
+    never SUCCESS. "done" turns are never represented in `history`
+    (DiscoveryHistoryEntry.action is required), so history stays empty."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose_done("the balance is already visible on the page"))
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT, DiscoveryLimits(max_steps=1))
+
+    assert result.status != DiscoveryStatus.SUCCESS
+    assert result.status == DiscoveryStatus.MAX_STEPS_EXCEEDED
+    assert result.history == []
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_repeatedly_declaring_done_without_progress_is_bounded_not_unbounded() -> None:
+    """A model that never produces a materializable action gets exactly
+    max_steps chances and no more -- the existing step limit is the only
+    bound needed; there is no separate retry budget to exhaust."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose_done(), propose_done(), propose_done())
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT, DiscoveryLimits(max_steps=3))
+
+    assert result.status == DiscoveryStatus.MAX_STEPS_EXCEEDED
+    assert result.steps_taken == 3
+    assert len(llm.calls) == 3  # never asked for a 4th turn
+
+
+@pytest.mark.asyncio
+async def test_rejected_done_feeds_back_corrective_context_and_accepts_a_read() -> None:
+    """After a "done" claim is rejected for producing no materializable
+    progress, the *next* call to the model must carry a concrete
+    corrective instruction in its observation (never in the persisted
+    trace -- see engine.py's _PROGRESS_REMINDER_TEXT comment), and a
+    subsequent READ the model proposes in response must actually execute
+    and have its value recorded in history, exactly as any other executed
+    action would."""
+
+    from cuas.domain import Locator, LocatorStrategy, Target
+
+    fake = FakeSurfaceAdapter()
+    balance_target = Target(primary=Locator(strategy=LocatorStrategy.ROLE_NAME, params={"role": "text", "name": "Savings Balance"}))
+    fake.script_read(balance_target, "$18204.55")
+
+    llm = FakeLLMClient(
+        propose_done("the balance is already visible on the page"),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+    )
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT, DiscoveryLimits(max_steps=2))
+
+    # The first call saw a clean observation; only the second (post-
+    # rejection) call carries the corrective reminder.
+    assert len(llm.calls) == 2
+    assert "replayed automatically later" not in llm.calls[0][2].visible_text
+    assert "replayed automatically later" in llm.calls[1][2].visible_text
+
+    # The READ the model proposed in response actually executed and was
+    # recorded -- bounded at max_steps=2, so the run still ends without a
+    # further "done" turn, but the progress it made is real.
+    assert result.steps_taken == 2
+    assert len(result.history) == 1
+    assert result.history[0].outcome == "executed"
+    assert result.history[0].action.action_type == ActionType.READ
+    assert result.history[0].read_value == "$18204.55"
+
+
+@pytest.mark.asyncio
+async def test_done_after_a_materializable_read_succeeds() -> None:
+    """The full corrective loop: done (rejected, nothing executed yet) ->
+    READ (executes, recorded) -> done again -- and this second "done" is
+    now accepted, because materializable progress genuinely exists."""
+
+    from cuas.domain import Locator, LocatorStrategy, Target
+
+    fake = FakeSurfaceAdapter()
+    balance_target = Target(primary=Locator(strategy=LocatorStrategy.ROLE_NAME, params={"role": "text", "name": "Savings Balance"}))
+    fake.script_read(balance_target, "$18204.55")
+
+    llm = FakeLLMClient(
+        propose_done("the balance is already visible on the page"),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+        propose_done("now recorded a READ of the balance"),
+    )
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.SUCCESS
+    assert result.steps_taken == 3
+    assert len(llm.calls) == 3
+    assert len(result.history) == 1
+    assert result.history[0].action.action_type == ActionType.READ
+    assert result.history[0].read_value == "$18204.55"
+
+
+@pytest.mark.asyncio
+async def test_flows_with_materializable_progress_are_unaffected_by_the_new_gate() -> None:
+    """A flow that already executes a READ before its first "done" must
+    behave exactly as it did before this fix: no extra corrective turn,
+    no extra STEP_FAILED event, the model is asked exactly as many times
+    as it was scripted for."""
+
+    fake = FakeSurfaceAdapter()
+    sink = InMemoryEventSink()
+    llm = FakeLLMClient(
+        propose("fill", "search_member", target=role_target("textbox"), value="M1001"),
+        propose("click", "view_account", target=role_target("button", "Search")),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+        propose_done("the savings balance is now visible"),
+    )
+
+    result = await _engine(fake, llm, event_sink=sink).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.SUCCESS
+    assert result.steps_taken == 4
+    assert len(llm.calls) == 4  # no corrective retry was ever needed
+    assert sink.events_of(EventType.STEP_FAILED) == []
+
+
+@pytest.mark.asyncio
+async def test_successful_run_emits_run_completed_exactly_once() -> None:
+    """Regression test for a duplicate discovery_engine run_completed
+    emission found in the real run's JSONL log: the success/"done" branch
+    used to emit RUN_COMPLETED itself, in addition to the trailing
+    unconditional emit every terminal branch already gets -- two events,
+    4.5ms apart, for one run. Only the redundant inline emit was removed;
+    every terminal branch (this included) still gets exactly one, from
+    the one place that already handled it correctly."""
+
+    fake = FakeSurfaceAdapter()
+    sink = InMemoryEventSink()
+    llm = FakeLLMClient(
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+        propose_done("balance recorded"),
+    )
+
+    result = await _engine(fake, llm, event_sink=sink).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.SUCCESS
+    assert len(sink.events_of(EventType.RUN_COMPLETED)) == 1

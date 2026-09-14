@@ -81,7 +81,7 @@ from cuas.observability.events import EventType, RunEvent
 from cuas.observability.evidence import EvidenceStore, NullEvidenceStore
 from cuas.observability.redaction import redact_dict, redact_named_values, redact_named_values_json
 from cuas.safety import PolicyDecision, PolicyEngine
-from cuas.surface.adapter import SurfaceAdapter
+from cuas.surface.adapter import Observation, SurfaceAdapter
 
 # How much of the current page text is kept in the persisted trace per
 # step -- a trace is a debugging/artifact-construction aid, not a full
@@ -100,6 +100,26 @@ _OUTCOME_CHECK_TIMEOUT_MS = 500
 _RECENT_ACTIONS_FOR_EVIDENCE = 5
 
 _SUPPORTED_LOCATOR_STRATEGIES = {LocatorStrategy.ROLE_NAME, LocatorStrategy.CSS}
+
+# Fed back as part of the *observation* text on the next turn only (never
+# written into the persisted trace's own observation_text_excerpt, which
+# stays an honest record of what the page actually showed) after a "done"
+# claim was rejected for producing no materializable progress -- see
+# DiscoveryEngine._has_materializable_progress. Deliberately a plain
+# instruction to use the existing structured action schema, not something
+# that hands the model a pre-built action: the model must still propose
+# it itself, through the same tool call every other turn uses, so the
+# trace accurately records what was actually executed (Phase 9's
+# ArtifactBuilder must never receive a fabricated action).
+_PROGRESS_REMINDER_TEXT = (
+    "This workflow will be replayed automatically later, without you "
+    "present, from a fresh page load. Declaring the goal done is not "
+    "enough by itself: nothing has been recorded yet that a future "
+    "replay could use to obtain the result. Propose one concrete action "
+    "(via this tool's normal action_type/target fields) that reads the "
+    "specific value the goal describes -- e.g. an explicit READ of it -- "
+    "before declaring done again."
+)
 
 
 class DiscoveryEngine:
@@ -160,6 +180,14 @@ class DiscoveryEngine:
         consecutive_repeats = 0
         total_tokens = 0
         start_time = self._clock()
+        # Set once a "done" claim is rejected for producing no
+        # materializable progress (see _has_materializable_progress) --
+        # from then on, every subsequent turn's observation carries a
+        # reminder until the model actually executes a READ. Never
+        # cleared back to False: once real progress exists, a later
+        # "done" simply succeeds regardless of this flag's value, so
+        # there is nothing to reset.
+        needs_progress_reminder = False
 
         await self._surface.navigate(goal.start_url)
         observation = await self._surface.observe()
@@ -187,7 +215,20 @@ class DiscoveryEngine:
 
             self._emit(run_id, EventType.STEP_STARTED, step_id=str(step_index), details={"url": redact_named_values(observation.url, named_values)})
 
-            llm_response = await self._llm.propose_action(goal=goal, context=context, observation=observation, history=history)
+            # `observation` itself (and everything derived from it below,
+            # e.g. trace_step.observation_text_excerpt) stays exactly what
+            # the surface actually showed -- only the copy sent to the
+            # model gets the reminder appended, so the persisted trace
+            # never mixes real page content with injected system text.
+            observation_for_model = observation
+            if needs_progress_reminder:
+                observation_for_model = Observation(
+                    url=observation.url, visible_text=observation.visible_text + "\n\n" + _PROGRESS_REMINDER_TEXT
+                )
+
+            llm_response = await self._llm.propose_action(
+                goal=goal, context=context, observation=observation_for_model, history=history
+            )
             total_tokens += llm_response.input_tokens + llm_response.output_tokens
 
             trace_step = DiscoveryTraceStep(
@@ -225,19 +266,38 @@ class DiscoveryEngine:
             if done:
                 trace_step.outcome = "declared_done"
                 trace.steps.append(trace_step)
+                if not self._has_materializable_progress(history):
+                    # The model is informed about policy but is never the
+                    # final authority on outcomes either -- and "the page
+                    # already shows the answer" is not the same claim as
+                    # "a reusable artifact can be built from this run".
+                    # ArtifactBuilder needs at least one *executed* READ
+                    # to derive a typed output at all (see
+                    # _has_materializable_progress); without one, "done"
+                    # is not trusted, exactly like an unverified
+                    # success_checkpoint below. Bounded by the same
+                    # max_steps/max_duration/max_tokens limits as every
+                    # other turn -- no separate retry budget.
+                    needs_progress_reminder = True
+                    self._emit(
+                        run_id, EventType.STEP_FAILED, step_id=str(step_index), status="info",
+                        details={
+                            "reason": "model declared done before any action was executed; "
+                            "cannot materialize a reusable artifact from this trace"
+                        },
+                    )
+                    continue  # noqa: consecutive-repeat/signature tracking intentionally not updated for "done" turns
                 if await self._verify_success_checkpoint(goal):
-                    self._emit(run_id, EventType.RUN_COMPLETED, status="success", details={"status": "success"})
                     result = DiscoveryResult(
                         run_id=run_id, status=DiscoveryStatus.SUCCESS, capability_id=goal.capability_id,
                         steps_taken=step_index + 1, history=self._redact_history(history, named_values),
                     )
                     break
-                # The model is informed about policy but is never the final
-                # authority on outcomes either: a declared success_checkpoint
-                # that doesn't verify means this "done" claim is not trusted,
-                # and the loop simply continues (bounded by the same limits
-                # as every other turn) rather than ending the run on the
-                # model's word alone.
+                # Same rationale as above: a declared success_checkpoint
+                # that doesn't verify means this "done" claim is not
+                # trusted either, and the loop simply continues (bounded
+                # by the same limits as every other turn) rather than
+                # ending the run on the model's word alone.
                 self._emit(
                     run_id, EventType.STEP_FAILED, step_id=str(step_index), status="info",
                     details={"reason": "model declared done but success_checkpoint did not verify"},
@@ -468,6 +528,33 @@ class DiscoveryEngine:
             return True
         except Exception:
             return False
+
+    def _has_materializable_progress(self, history: list[DiscoveryHistoryEntry]) -> bool:
+        """Whether this trace, so far, contains at least one executed
+        action ArtifactBuilder could actually build a reusable artifact
+        from -- the gate a "done" claim must clear before discovery is
+        allowed to report success.
+
+        Deliberately narrower than "any executed action at all": a
+        random executed click/fill/dismiss unrelated to the goal must
+        not count, or a workflow could satisfy this by doing something
+        irrelevant. The specific bar chosen is "at least one executed
+        READ", because that is not an arbitrary, discovery-only rule --
+        it is the exact same requirement `ArtifactBuilder.build()`
+        already enforces unconditionally downstream: `_build_outputs`
+        turns only READ actions into a declared OutputSpec, and `build()`
+        refuses to construct an artifact with no outputs at all (module
+        docstring point 5; see also point 8's leading-navigate-step fix,
+        which this complements -- that fix ensures a *replayable* path
+        exists for a successful trace, this one ensures a trace is only
+        ever reported successful once it actually has one). Checking it
+        here, before discovery ever reports SUCCESS, means a model that
+        spots the answer without an action to fetch it gets a chance to
+        correct course, instead of the run finishing "successfully" and
+        then failing anyway when RunOrchestrator tries to materialize it
+        (see DECISIONS_LOG.md for the real run that first exposed this)."""
+
+        return any(entry.outcome == "executed" and entry.action.action_type == ActionType.READ for entry in history)
 
     # -- loop/repetition detection -----------------------------------------
 

@@ -102,3 +102,72 @@ async def test_artifact_built_from_a_real_discovery_run_replays_with_a_different
     assert replay_result.status == ReplayStatus.SUCCESS
     output_name = artifact.success_condition.output
     assert replay_result.outputs[output_name] == Decimal("9900.00")
+
+
+
+@pytest.mark.asyncio
+async def test_premature_done_is_corrected_then_artifact_replays_with_a_different_input(demo_app_base_url: str, tmp_path) -> None:
+    """Regression test for the real Anthropic-backed discovery run that
+    first exposed the "materializable progress" gap (see DECISIONS_LOG.md):
+    the model declared done on its very first turn, having executed
+    nothing at all, because the answer it was after was already visible
+    in the page text. DiscoveryEngine must reject that claim and feed
+    back a corrective instruction rather than ending the run successfully
+    -- only once the model actually dismisses the popup, searches, and
+    READs the balance does a second "done" get accepted. This is the same
+    successful flow test_artifact_built_from_a_real_discovery_run_replays_
+    with_a_different_input already proves end to end; this test proves
+    the pipeline still reaches that same successful, replayable artifact
+    even when the model needs correcting first, against the real demo app
+    and a real browser -- not just DiscoveryEngine in isolation."""
+
+    llm = FakeLLMClient(
+        propose_done("the balance is already visible on the page"),
+        propose("click", "dismiss_known_popup", target=role_target("button", "OK")),
+        propose("fill", "search_member", target=role_target("textbox"), value="M1001"),
+        propose("click", "view_account", target=role_target("button", "Search")),
+        propose("read", "open_member_record", target=css_target("#acct-row-2 td:nth-child(3)", frame="#accounts-frame")),
+        propose_done("the savings balance has been read"),
+    )
+    goal = DiscoveryGoal(
+        capability_id="get_savings_balance",
+        description="Find member M1001 and read their savings balance.",
+        start_url=demo_app_base_url + "/",
+        inputs={"member_id": "M1001"},
+        sensitive_inputs={"member_id"},
+        success_checkpoint=WaitCondition(kind=WaitConditionKind.TEXT_PRESENT, text="Accounts"),
+        known_business_outcomes=[
+            BusinessOutcome(code="MEMBER_NOT_FOUND", detect=WaitCondition(kind=WaitConditionKind.TEXT_PRESENT, text="Member not found."))
+        ],
+    )
+    trace_store = FileDiscoveryTraceStore(tmp_path)
+
+    async with launch_playwright_surface() as surface:
+        engine = DiscoveryEngine(surface, LayeredPolicyEngine(), llm, trace_store=trace_store)
+        discovery_result = await engine.run(goal, CONTEXT)
+
+    assert discovery_result.status == DiscoveryStatus.SUCCESS
+    # 6 turns total (the rejected done counts as a turn); only the 4
+    # subsequently-*executed* actions ever land in `history` -- a
+    # rejected "done" proposes no action at all, so it cannot and does
+    # not appear there (DiscoveryHistoryEntry.action is required).
+    assert discovery_result.steps_taken == 6
+    assert len(discovery_result.history) == 4
+
+    trace = trace_store.load(discovery_result.run_id)
+    artifact = ArtifactBuilder().build(trace, goal, CONTEXT)
+
+    # Identical artifact shape to the uncorrected flow -- the rejected
+    # "done" left nothing behind for ArtifactBuilder to see in the first
+    # place, so it cannot and does not affect the artifact it builds.
+    assert len(artifact.steps) == 4
+    assert [s.action_type.value for s in artifact.steps] == ["navigate", "click", "fill", "click"]
+    assert artifact.steps[0].id == "navigate_to_discovery_start"
+
+    async with launch_playwright_surface() as replay_surface:
+        replay_engine = ReplayEngine(replay_surface, LayeredPolicyEngine())
+        replay_result = await replay_engine.run(artifact, {"member_id": "M1002"}, CONTEXT)
+
+    assert replay_result.status == ReplayStatus.SUCCESS
+    output_name = artifact.success_condition.output
+    assert replay_result.outputs[output_name] == Decimal("9900.00")
