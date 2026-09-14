@@ -1,0 +1,15 @@
+{
+  "_note": "Same caveat as scenario 01's reconstructed_run_response.json: the system does not persist raw HTTP response bytes, so this is a reconstruction -- every field is taken from the real, persisted event log in fab1522275624dfb850b47e9fe08b045.jsonl (this folder) mapped onto the real RunResponse schema (src/cuas/api/schemas.py) and RunOrchestrator's own RunResult construction for the BUSINESS_OUTCOME branch, not an invented value.",
+  "run_id": "fab1522275624dfb850b47e9fe08b045",
+  "capability_id": "get_savings_balance",
+  "outcome": "business_outcome",
+  "outputs": {},
+  "business_outcome_code": "MEMBER_NOT_FOUND",
+  "error_code": null,
+  "error_message": null,
+  "reason": null,
+  "intervention_id": null,
+  "session_id": null,
+  "artifact_version": "1.0.1",
+  "discovered_new_capability": false
+}

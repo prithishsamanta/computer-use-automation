@@ -1,0 +1,19 @@
+{
+  "run_id": "720f35e5933645f3920ae893b3f1bb64",
+  "step_id": "submit_search",
+  "captured_at": "2026-09-13T20:51:02.554949Z",
+  "reason": "checkpoint_failed",
+  "error_code": "CHECKPOINT_FAILED",
+  "error_message": "checkpoint for step 'submit_search' failed after recovery: Locator.wait_for: Timeout 5000ms exceeded.\nCall log:\n  - waiting for get_by_text(\"Accounts\").first to be visible\n",
+  "url": "http://demo-app:8080/search?query=Smith",
+  "recent_actions": [
+    "None:recoverable_condition_detected",
+    "submit_search:recovery_retry",
+    "submit_search:step_executed",
+    "None:recoverable_condition_detected",
+    "submit_search:checkpoint_failed"
+  ],
+  "screenshot_path": "001_submit_search.png",
+  "dom_snapshot_path": "001_submit_search.dom.json",
+  "screenshot_is_unredacted_pii_risk": true
+}

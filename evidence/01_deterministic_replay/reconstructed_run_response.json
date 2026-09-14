@@ -1,0 +1,17 @@
+{
+  "_note": "The running system does not persist raw HTTP response bytes anywhere on disk (no data/runs/ or similar store exists in this repo). This object is not a captured copy of the literal API response -- it is reconstructed by mapping the real, persisted event log in 8781cbc67b0e42ad985f7750f4f09a84.jsonl (in this same folder) onto the real RunResponse schema in src/cuas/api/schemas.py, and onto orchestration/orchestrator.py's own RunResult construction (the 'common' fields: run_id, capability_id, artifact_version, discovered_new_capability, plus outcome/outputs for the SUCCESS branch). Every field value below is taken directly from that log or from the run_id/outcome/savings_balance the developer reported after actually issuing this request through the real Docker container -- nothing here is invented.",
+  "run_id": "8781cbc67b0e42ad985f7750f4f09a84",
+  "capability_id": "get_savings_balance",
+  "outcome": "success",
+  "outputs": {
+    "savings_balance": "18204.55"
+  },
+  "business_outcome_code": null,
+  "error_code": null,
+  "error_message": null,
+  "reason": null,
+  "intervention_id": null,
+  "session_id": null,
+  "artifact_version": "1.0.1",
+  "discovered_new_capability": false
+}

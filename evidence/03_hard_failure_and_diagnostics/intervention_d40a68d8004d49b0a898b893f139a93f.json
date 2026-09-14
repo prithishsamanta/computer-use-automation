@@ -1,0 +1,14 @@
+{
+  "id": "d40a68d8004d49b0a898b893f139a93f",
+  "run_id": "720f35e5933645f3920ae893b3f1bb64",
+  "capability_id": "get_savings_balance",
+  "tenant_id": "base",
+  "current_step": null,
+  "reason": "checkpoint for step 'submit_search' failed after recovery: Locator.wait_for: Timeout 5000ms exceeded.\nCall log:\n  - waiting for get_by_text(\"Accounts\").first to be visible\n",
+  "evidence": {},
+  "session_id": "07e576a073e446fcad356a2a05a44f6f",
+  "status": "resolved",
+  "claimed_by": "teller-1",
+  "created_at": "2026-09-13T20:51:02.556550Z",
+  "resolved_at": "2026-09-13T21:45:56.368565Z"
+}
