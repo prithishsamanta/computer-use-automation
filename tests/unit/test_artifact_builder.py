@@ -99,8 +99,13 @@ def test_clean_successful_trace_becomes_an_artifact() -> None:
 
     artifact = ArtifactBuilder().build(trace, goal, CONTEXT)
 
-    assert [s.action_type for s in artifact.steps] == [ActionType.FILL, ActionType.CLICK]
-    assert artifact.steps[0].value == "{{member_id}}"
+    assert [s.action_type for s in artifact.steps] == [ActionType.NAVIGATE, ActionType.FILL, ActionType.CLICK]
+    # steps[0] is the deterministic navigate-to-start step ArtifactBuilder
+    # itself prepends (never model-driven) -- see build()'s own docstring
+    # point 8. The model's first *recorded* action, the FILL, is steps[1].
+    assert artifact.steps[0].id == "navigate_to_discovery_start"
+    assert artifact.steps[0].value == goal.start_url
+    assert artifact.steps[1].value == "{{member_id}}"
     assert artifact.steps[-1].checkpoint == goal.success_checkpoint  # carried onto the last non-READ step
     assert list(artifact.outputs) == ["savings_balance"]  # "read_" prefix stripped from the READ's intent
     assert artifact.outputs["savings_balance"].type == OutputType.DECIMAL
@@ -111,10 +116,16 @@ def test_clean_successful_trace_becomes_an_artifact() -> None:
     assert artifact.safety.risk == RiskLevel.SAFE
     assert artifact.provenance.created_from_run == "run-happy"
     assert artifact.version == "1.0.0"
-    # Every constructed Step leaves risk unset, exactly as discovery left
-    # Action.risk unset -- LayeredPolicyEngine's fail-closed behavior for
-    # an unrecognized intent must govern a replay of this artifact too.
-    assert "risk" not in artifact.steps[0].model_fields_set
+    # Every *model-driven* constructed Step leaves risk unset, exactly as
+    # discovery left Action.risk unset -- LayeredPolicyEngine's
+    # fail-closed behavior for an unrecognized intent must govern a
+    # replay of this artifact too.
+    assert "risk" not in artifact.steps[1].model_fields_set
+    # The one deliberate exception is the prepended navigate step, which
+    # explicitly declares risk=SAFE since it was never itself a policy
+    # decision discovery made -- see _build_navigate_to_start_step.
+    assert artifact.steps[0].risk == RiskLevel.SAFE
+    assert "risk" in artifact.steps[0].model_fields_set
 
 
 def test_trace_with_a_wrong_turn_detour_produces_an_artifact_without_it() -> None:
@@ -126,7 +137,7 @@ def test_trace_with_a_wrong_turn_detour_produces_an_artifact_without_it() -> Non
     ]
     artifact = ArtifactBuilder().build(_trace(steps), _goal(), CONTEXT)
 
-    assert len(artifact.steps) == 2
+    assert len(artifact.steps) == 3  # navigate-to-start, fill, click (the wrong-button click never counted)
     assert all(step.target.primary.params.get("name") != "WrongButton" for step in artifact.steps if step.target)
 
 
@@ -142,7 +153,8 @@ def test_sensitive_literal_values_become_typed_input_placeholders() -> None:
     ]
     artifact = ArtifactBuilder().build(_trace(steps), _goal(inputs={"member_id": "M1001"}, sensitive_inputs={"member_id"}), CONTEXT)
 
-    assert artifact.steps[0].value == "{{member_id}}"
+    assert artifact.steps[0].action_type == ActionType.NAVIGATE  # the prepended deterministic setup step
+    assert artifact.steps[1].value == "{{member_id}}"
     assert "M1001" not in artifact.model_dump_json()
 
 
@@ -186,7 +198,7 @@ def test_adjacent_duplicate_actions_are_collapsed_conservatively() -> None:
     ]
     artifact = ArtifactBuilder().build(_trace(steps), _goal(), CONTEXT)
 
-    assert len(artifact.steps) == 2  # the duplicate fill collapsed to one
+    assert len(artifact.steps) == 3  # navigate-to-start + the duplicate fill collapsed to one + click
 
 
 def test_non_adjacent_repeats_are_preserved_not_deduplicated() -> None:
@@ -202,7 +214,61 @@ def test_non_adjacent_repeats_are_preserved_not_deduplicated() -> None:
     ]
     artifact = ArtifactBuilder().build(_trace(steps), _goal(), CONTEXT)
 
-    assert len(artifact.steps) == 3  # nothing collapsed
+    assert len(artifact.steps) == 4  # navigate-to-start + nothing else collapsed
+
+
+def test_discovered_artifact_gets_a_leading_navigate_to_start_step() -> None:
+    """Regression test for the ArtifactBuilder navigate-step fix
+    (DECISIONS_LOG.md): DiscoveryEngine.run() navigates to
+    `goal.start_url` *before* recording a single trace step (engine.py's
+    `await self._surface.navigate(goal.start_url)` precedes the step
+    loop entirely), so a naively reconstructed artifact was always
+    missing that prerequisite -- replaying it from a fresh, unnavigated
+    surface (exactly what RunOrchestrator hands every non-resumed run)
+    would start on about:blank, the same defect class already found and
+    fixed for the hand-authored get_savings_balance artifact.
+
+    Proves: (1) a leading NAVIGATE step to goal.start_url is present, and
+    (2) the trace's own successful actions still follow it in the exact
+    order DiscoveryEngine recorded them."""
+
+    goal = _goal(start_url="http://demo-app.invalid/search")
+    artifact = ArtifactBuilder().build(_trace(_happy_path_steps()), goal, CONTEXT)
+
+    assert artifact.steps[0].action_type == ActionType.NAVIGATE
+    assert artifact.steps[0].id == "navigate_to_discovery_start"
+    assert artifact.steps[0].value == "http://demo-app.invalid/search"
+    # The model-driven steps (fill, then click) are unchanged in content
+    # and still follow the prepended navigate step in their original order.
+    assert [s.action_type for s in artifact.steps] == [ActionType.NAVIGATE, ActionType.FILL, ActionType.CLICK]
+    assert artifact.steps[1].value == "{{member_id}}"
+    assert artifact.steps[2].target.primary.params.get("name") == "Search"
+
+
+def test_read_only_discovery_still_gets_a_leading_navigate_step() -> None:
+    """A discovery whose only useful model action was a single READ (no
+    fill/click at all -- e.g. the goal's start_url already puts the
+    surface where the value lives) is the sharpest version of the bug:
+    _build_steps excludes READ actions entirely (they become an
+    OutputSpec, not a Step -- see build()'s point 5), so without this fix
+    such an artifact would have had *zero* steps and nothing at all to
+    reach its own output with on replay."""
+
+    steps = [_step(0, "read", "read_savings_balance", target=_css("#balance"), read_value="$100.00")]
+    goal = _goal(start_url="http://demo-app.invalid/members/M1001/accounts")
+
+    artifact = ArtifactBuilder().build(_trace(steps), goal, CONTEXT)
+
+    assert len(artifact.steps) == 1
+    assert artifact.steps[0].action_type == ActionType.NAVIGATE
+    assert artifact.steps[0].value == "http://demo-app.invalid/members/M1001/accounts"
+    assert artifact.steps[0].risk == RiskLevel.SAFE
+    assert list(artifact.outputs) == ["savings_balance"]
+    # Safety metadata is computed from the model-driven steps only (none,
+    # here) -- the prepended navigate step must not make ArtifactBuilder
+    # claim "open_start_page" as this capability's overall intent; the
+    # pre-existing output-name fallback still applies.
+    assert artifact.safety.intent == "savings_balance"
 
 
 def test_provenance_and_version_metadata() -> None:

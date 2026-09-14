@@ -56,9 +56,27 @@ Algorithm:
    governs a replay of this artifact exactly the way it governed the
    original discovery run. `ArtifactSafety` summarizes the capability's
    overall intent/risk the same deterministic way (`_overall_intent`,
-   `_overall_risk`) -- it is informational metadata only, never itself the
-   enforcement authority (.CLAUDE/02_ARTIFACT_SCHEMA.md, "Safety Metadata").
-8. Construct the `Artifact` pydantic model. Its own validators
+   `_overall_risk`), computed from *these* steps only, before the
+   deterministic setup step below is added -- it is informational
+   metadata only, never itself the enforcement authority
+   (.CLAUDE/02_ARTIFACT_SCHEMA.md, "Safety Metadata").
+8. Prepend one deterministic `NAVIGATE` step to `goal.start_url`
+   (`_build_navigate_to_start_step`) -- not an LLM decision, and not part
+   of the steps `_overall_intent`/`_overall_risk` summarize (point 7
+   already ran). `DiscoveryEngine.run()` navigates to `goal.start_url`
+   *before* recording a single trace step (engine.py: `await
+   self._surface.navigate(goal.start_url)` precedes the step loop
+   entirely), so the successful path this builder reconstructs from the
+   trace is always missing that prerequisite -- without it, replaying
+   this artifact from a fresh, unnavigated surface (exactly what
+   `RunOrchestrator` hands every non-resumed run) would start on
+   `about:blank`, the same defect class DECISIONS_LOG.md's
+   `get_savings_balance` bugfix entry describes for a hand-authored
+   artifact. `goal.success_checkpoint`, if declared, attaches to this
+   step instead when it ends up the *only* step (a discovery whose
+   entire successful path was a single READ has nothing else to attach
+   it to).
+9. Construct the `Artifact` pydantic model. Its own validators
    (`_step_ids_are_unique`, `_success_condition_references_a_declared_output`,
    `_version_is_semver`, every field's own type) are what actually gate
    whether this becomes storable -- this module does not duplicate that
@@ -142,11 +160,25 @@ class ArtifactBuilder:
             )
 
         success_condition = SuccessCondition(type=SuccessConditionType.OUTPUT_VALID, output=next(iter(outputs)))
-        if goal.success_checkpoint is not None and steps:
-            steps[-1] = steps[-1].model_copy(update={"checkpoint": goal.success_checkpoint})
 
         resolved_capability_id = capability_id or trace.capability_id
+        # Computed from the model-driven steps only, before the
+        # deterministic navigate-to-start step below is prepended -- see
+        # module docstring point 8. That step was never an LLM decision;
+        # it must not skew what this artifact's safety metadata says
+        # about the capability's own intent/risk.
         safety = ArtifactSafety(intent=self._overall_intent(steps, outputs), risk=self._overall_risk())
+
+        # Module docstring point 8 / _build_navigate_to_start_step's own
+        # docstring: DiscoveryEngine navigates to goal.start_url before
+        # recording any trace step, so the successful path reconstructed
+        # above is always missing that prerequisite. `steps` is
+        # guaranteed non-empty from here on, even when kept_steps' only
+        # executed action was a READ (which _build_steps excludes
+        # entirely -- see point 5).
+        steps = [self._build_navigate_to_start_step(goal), *steps]
+        if goal.success_checkpoint is not None:
+            steps[-1] = steps[-1].model_copy(update={"checkpoint": goal.success_checkpoint})
 
         try:
             return Artifact(
@@ -261,6 +293,32 @@ class ArtifactBuilder:
                 )
             )
         return steps
+
+    def _build_navigate_to_start_step(self, goal: DiscoveryGoal) -> Step:
+        """The one Step in a discovered artifact that is deterministic
+        orchestration setup, not a recorded LLM decision -- see module
+        docstring point 8 for why it must exist at all.
+
+        `risk` is explicitly set to SAFE, unlike every other constructed
+        Step (which deliberately leaves it unset -- point 7): this
+        navigation was never itself a policy decision to begin with.
+        DiscoveryEngine's own `await self._surface.navigate(goal.start_url)`
+        runs before the step loop starts, completely unconditionally --
+        no PolicyEngine.evaluate() call ever governed it during discovery
+        (engine.py has none for it). Marking it SAFE here only makes
+        replay trust it exactly as much as discovery already implicitly
+        did, through LayeredPolicyEngine's ordinary risk-as-opinion path
+        (safety/policy.py: an explicitly-set `risk` counts as one more
+        opinion via `action.model_fields_set`) -- not a new bypass, and
+        not a blanket ALLOW for some other, undeclared intent."""
+
+        return Step(
+            id="navigate_to_discovery_start",
+            action_type=ActionType.NAVIGATE,
+            intent="open_start_page",
+            value=goal.start_url,
+            risk=RiskLevel.SAFE,
+        )
 
     # -- outputs ------------------------------------------------------------
 

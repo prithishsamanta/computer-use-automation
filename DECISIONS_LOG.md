@@ -1461,3 +1461,100 @@ proved it correct, and this bug never applied to it.
 **Not changed:** the artifact schema, `ReplayEngine`, `RunOrchestrator`,
 `LayeredPolicyEngine`, any locator, or `tests/fixtures/sample_artifacts.py`
 itself.
+
+
+### Bugfix (pre-live-LLM-run prep) — discovered artifacts had no leading NAVIGATE step
+
+**Symptom (found by read-only inspection, before any live Anthropic call
+was made):** `DiscoveryEngine.run()` navigates to `DiscoveryGoal.start_url`
+*before* the step loop begins and before a single trace step is recorded
+(`await self._surface.navigate(goal.start_url)` precedes the loop
+entirely, engine.py). `ArtifactBuilder.build()` reconstructs an artifact's
+`steps` only from what the trace actually recorded, so it never carried a
+NAVIGATE step for that initial, pre-loop navigation — for a discovery
+whose only useful model action was a single READ (e.g. the goal's
+`start_url` already puts the surface where the value lives), the built
+artifact would have had **zero** `Step`s at all (`_build_steps` excludes
+READ actions entirely; they become an `OutputSpec` instead). Any
+subsequent replay of such an artifact — including `RunOrchestrator`'s own
+*mandatory* verification replay immediately after a successful discovery,
+which always runs on a brand-new, unnavigated surface exactly like every
+other non-resumed run — would try to extract its output from
+`about:blank`. This is the same defect class as the `get_savings_balance`
+bugfix above, except structural to the discovery→artifact pipeline itself
+rather than one hand-authored fixture: *every* discovered capability was
+affected, regardless of which goal produced it.
+
+**Root cause:** `ArtifactBuilder` never referenced `goal.start_url` at
+all (confirmed: zero occurrences of `start_url`/`NAVIGATE` anywhere in
+`artifact_builder/builder.py` before this fix) — the deterministic setup
+navigation discovery itself depends on was simply never carried forward
+into the reusable artifact.
+
+**Fix (`src/cuas/artifact_builder/builder.py` only):** `build()` now
+prepends one deterministic `NAVIGATE` step to `goal.start_url`
+(`_build_navigate_to_start_step`), added *after* `_overall_intent`/
+`_overall_risk` are computed from the real, model-driven steps (so the
+synthetic step can't skew what the artifact's safety metadata says about
+its own intent/risk) and before the artifact is constructed. This step's
+`risk` is explicitly set to `SAFE` — the one deliberate exception to "every
+constructed Step leaves risk unset" — because this navigation was never
+itself a policy decision `DiscoveryEngine` made in the first place (it
+runs unconditionally, before any `PolicyEngine.evaluate()` call exists for
+it); marking it `SAFE` here only makes replay trust it exactly as much as
+discovery already implicitly did, via `LayeredPolicyEngine`'s ordinary
+risk-as-opinion mechanism (`action.model_fields_set`), not a new bypass.
+`DiscoveryGoal.start_url` was already a plain field on the `goal` object
+`build()` already receives as a parameter — no interface change was
+needed to access it.
+
+**Deliberately not done:** no change to `DiscoveryEngine` (the trace
+continues to represent only what the model actually did — this navigation
+was never an LLM decision, so it does not belong in the trace as if it
+were one); no capability-specific registration workaround (unlike the
+`get_savings_balance` fix above, which predates this one and was
+necessarily a one-off script since that artifact was hand-authored, not
+discovered); no change to any existing, published artifact
+(`get_savings_balance` `1.0.0`/`1.0.1`, `close_member_account` `1.0.0` —
+none of these were built by `ArtifactBuilder` and none were touched); no
+new replay special-casing (the prepended step is an ordinary `Step` using
+the existing `Artifact`/`Action` schema and the normal replay path, same
+as every hand-authored NAVIGATE step already in this repo).
+
+**Regression tests added:**
+- `tests/unit/test_artifact_builder.py`: two new tests —
+  `test_discovered_artifact_gets_a_leading_navigate_to_start_step` (a
+  normal fill/click/read trace gets a leading NAVIGATE to `start_url`,
+  followed by the original actions in their original order) and
+  `test_read_only_discovery_still_gets_a_leading_navigate_step` (the
+  sharpest case: a trace whose only executed action was a READ still
+  produces a one-step artifact — the NAVIGATE — instead of zero, and
+  `safety.intent` still falls back to the output-name convention rather
+  than being skewed by the synthetic step). Five pre-existing tests in
+  the same file had hardcoded step counts/indices from before the fix
+  (`test_clean_successful_trace_becomes_an_artifact`,
+  `test_trace_with_a_wrong_turn_detour_produces_an_artifact_without_it`,
+  `test_sensitive_literal_values_become_typed_input_placeholders`,
+  `test_adjacent_duplicate_actions_are_collapsed_conservatively`,
+  `test_non_adjacent_repeats_are_preserved_not_deduplicated`) and were
+  updated to account for the new leading step, not reverted.
+- `tests/integration/test_artifact_builder_e2e.py`: the existing
+  real-discovery-to-real-replay test used to call
+  `await replay_surface.navigate(...)` itself before `ReplayEngine.run()`
+  — exactly the test-harness pattern that had masked this bug (and the
+  earlier `get_savings_balance` one) from ever being caught. That manual
+  navigate call was removed; the test now proves the artifact's *own*
+  leading NAVIGATE step is what gets a genuinely fresh, unnavigated
+  surface (`about:blank`) to the right page, matching what
+  `RunOrchestrator` actually hands every non-resumed run in production.
+
+**Verified:** `tests/unit/test_artifact_builder.py` (15 tests, all
+passing) + full deterministic suite `-m "not integration and not
+live_llm"` (168 passed, 16 deselected, zero regressions) run directly on
+the developer's machine. `tests/integration/test_artifact_builder_e2e.py`
+and `tests/integration/test_run_orchestrator_e2e.py` (4 tests total) were
+additionally run for real against a live browser via the cloud-sandbox
+round-trip (§5) — all 4 pass, including the now-unmasked
+fresh-surface-replay assertion. No Anthropic call was made; this entire
+fix and its verification used `FakeLLMClient` only, per instruction —
+this is a pipeline-correctness fix, not evidence of live LLM usage.

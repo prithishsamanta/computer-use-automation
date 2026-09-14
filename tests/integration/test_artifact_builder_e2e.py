@@ -3,8 +3,18 @@ just a replay of the exact discovery run it came from: a real
 DiscoveryEngine run against the real demo app (FakeLLMClient, no LLM key)
 produces a real successful DiscoveryTrace; ArtifactBuilder turns that
 trace into an Artifact; the resulting Artifact then replays successfully
-through the real ReplayEngine against a *fresh* page load, with a
-*different* member id than the one used during discovery.
+through the real ReplayEngine, starting from a genuinely fresh,
+*unnavigated* surface (about:blank -- exactly what RunOrchestrator hands
+every non-resumed run in production, never pre-navigated by this test),
+with a *different* member id than the one used during discovery.
+
+That last part is also this repo's regression test for the ArtifactBuilder
+navigate-step fix (see DECISIONS_LOG.md): DiscoveryEngine navigates to
+`goal.start_url` before recording a single trace step, so a naively
+reconstructed artifact has no leading NAVIGATE step and fails exactly
+this way when replayed from a fresh surface -- this test used to paper
+over that by navigating the replay surface itself before calling
+`ReplayEngine.run()`; it no longer does, on purpose.
 
 Marked `integration` (pyproject.toml): needs a real browser, never an
 LLM/API key.
@@ -70,16 +80,22 @@ async def test_artifact_built_from_a_real_discovery_run_replays_with_a_different
 
     artifact = ArtifactBuilder().build(trace, goal, CONTEXT)
 
-    assert len(artifact.steps) == 3  # dismiss + fill + click; the READ became an output, not a Step
-    assert [s.action_type.value for s in artifact.steps] == ["click", "fill", "click"]
-    assert artifact.steps[1].value == "{{member_id}}"
+    # navigate-to-start (ArtifactBuilder's own deterministic prepend) +
+    # dismiss + fill + click; the READ became an output, not a Step.
+    assert len(artifact.steps) == 4
+    assert [s.action_type.value for s in artifact.steps] == ["navigate", "click", "fill", "click"]
+    assert artifact.steps[0].id == "navigate_to_discovery_start"
+    assert artifact.steps[0].value == goal.start_url
+    assert artifact.steps[0].risk.value == "safe"  # explicit -- see _build_navigate_to_start_step
+    assert artifact.steps[2].value == "{{member_id}}"
     assert "M1001" not in artifact.model_dump_json()
 
-    # The real proof of reuse: replay the *constructed* artifact, fresh
-    # page load, with a member id that was never part of the discovery
-    # run at all.
+    # The real proof of reuse -- and, since it deliberately does NOT
+    # pre-navigate this surface itself, the regression test for the
+    # ArtifactBuilder navigate-step fix: replay the *constructed*
+    # artifact from a genuinely fresh, unnavigated surface (about:blank),
+    # with a member id that was never part of the discovery run at all.
     async with launch_playwright_surface() as replay_surface:
-        await replay_surface.navigate(demo_app_base_url + "/")
         replay_engine = ReplayEngine(replay_surface, LayeredPolicyEngine())
         replay_result = await replay_engine.run(artifact, {"member_id": "M1002"}, CONTEXT)
 
