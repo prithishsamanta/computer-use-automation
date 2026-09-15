@@ -89,22 +89,27 @@ _TOOL_SCHEMA: dict[str, Any] = {
                 "description": "Required for fill (the text to type) and navigate (the URL).",
             },
         },
+        # `intent` cannot simply move into this flat `required` list -- a
+        # done=true response legitimately omits it (see `done`'s own
+        # description above), and Anthropic's custom-tool input_schema
+        # rejects a conditional shape entirely: an earlier version of this
+        # schema declared a top-level `anyOf: [{"required": ["done"]},
+        # {"required": ["intent"]}]` to express "either a done claim, or
+        # intent present," and Anthropic's API rejected the whole request
+        # with `tools.0.custom.input_schema: input_schema does not support
+        # oneOf, allOf, or anyOf at the top level" -- a real run,
+        # aacd3ecc913d48d8ae9bd88100b93aba, hit exactly this before the
+        # model was ever called (DECISIONS_LOG.md). Anthropic's accepted
+        # schema subset has no way to express "field X is required only
+        # when field Y is absent," so conditional requiredness for `intent`
+        # cannot be declared here at all -- only documented (see `intent`'s
+        # own description above, and this comment) and enforced at runtime.
+        # `DiscoveryEngine._parse_proposal` is the actual, authoritative
+        # validator for exactly this rule (action_type/intent required,
+        # target/value required per action_type, done exempt from all of
+        # it) and is never weakened by what this schema can or cannot
+        # declare.
         "required": ["reasoning"],
-        # `intent` cannot simply move into the flat `required` list above --
-        # a done=true response legitimately omits it (see `done`'s own
-        # description above). This says "reasoning is always required, and
-        # additionally: either this is a done claim, or intent is present" --
-        # the smallest way to make intent required for exactly the case
-        # DiscoveryEngine._parse_proposal already treats as required, without
-        # rejecting a valid done=true response. Anthropic tool-use does not
-        # hard-enforce this schema server-side the way strict/structured
-        # outputs do, so this is instruction to the model, not a substitute
-        # for _parse_proposal's own runtime validation -- that stays as
-        # defense in depth regardless of what this schema declares.
-        "anyOf": [
-            {"required": ["done"]},
-            {"required": ["intent"]},
-        ],
     },
 }
 

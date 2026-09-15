@@ -2104,3 +2104,120 @@ already-redacted `trace_step.parse_error`, never the raw `parse_error`,
 so no new raw-sensitive-value exposure path was introduced. The real run
 (`e199e82bd3774cf6af2124d699ca5cfa`) and its intervention
 (`0f0b938ecdf04e1181a0564c3fa44e4e`, still `pending`) were not touched.
+### Correction to 01f4fff -- Anthropic rejects top-level `anyOf`/`oneOf`/`allOf` in a custom tool's `input_schema`
+
+**Symptom (real Anthropic call attempt, run `aacd3ecc913d48d8ae9bd88100b93aba`,
+capability `discover_savings_balance_demo`):** the request was rejected by
+Anthropic's API before the model was ever invoked --
+`tools.0.custom.input_schema: input_schema does not support oneOf, allOf,
+or anyOf at the top level`. Confirmed by reading the run's log read-only:
+it stops right after `step_started` at step 0 -- no
+`llm_action_proposed`, no `malformed_model_output`, no `run_completed` --
+because the exception from `self._client.messages.create(...)` (inside
+`AnthropicLLMClient.propose_action`) was raised before `DiscoveryEngine`
+ever got a response to parse. No trace file and no intervention exist for
+this run_id, consistent with an unhandled exception escaping the loop
+entirely rather than a normal discovery-engine terminal status. The
+offending construct was `01f4fff`'s own fix: a top-level `"anyOf":
+[{"required": ["done"]}, {"required": ["intent"]}]` added to
+`_TOOL_SCHEMA["input_schema"]` to express "intent required unless done is
+true." That schema was never actually sent to Anthropic in `01f4fff`'s
+own verification (all tests use `FakeLLMClient`, and no Anthropic call was
+made per that work's explicit constraint) -- this incompatibility only
+surfaced on this real call.
+
+**The correction:** the top-level `anyOf` is removed entirely.
+`_TOOL_SCHEMA["input_schema"]["required"]` is back to the flat
+`["reasoning"]` it was before `01f4fff` -- `intent` is NOT added to it
+(doing so would make the legitimate `{"reasoning": "...", "done": true}`
+response schema-invalid, which the instruction for this correction
+explicitly ruled out). `intent`'s description (added in `01f4fff`,
+unchanged here: "...Required for every action proposal, i.e. whenever
+done is not true.") stays as the only place this rule is stated to the
+model. A long comment now documents, in place of the old `anyOf`, exactly
+why: Anthropic's accepted custom-tool schema subset has no way to express
+"field X is required only when field Y is absent" -- there is no
+conditional-requiredness construct available at all, not just a
+differently-shaped one -- so this is a genuine, permanent limitation of
+what can be declared here, not a bug to work around with cleverer JSON
+Schema. `DiscoveryEngine._parse_proposal` was already, and remains, the
+actual authoritative validator for the real rule (action_type/intent
+required for a non-done proposal, target/value required per action_type,
+done exempt from all of it) -- nothing about its validation logic changed
+in this correction; `01f4fff`'s bounded bounded-malformed-output-recovery
+loop, `_require_field`'s deterministic error messages, and
+`DiscoveryPendingApproval`/`3904afe`'s non-interaction are all untouched
+(confirmed: `git diff --stat -- src/cuas/discovery/engine.py` is empty
+for this correction -- only `anthropic_client.py` and one test file
+changed).
+
+**Tests:** `tests/unit/test_anthropic_tool_schema.py` rewritten --
+removed the two tests asserting the now-incompatible `anyOf` shape, added
+`test_schema_stays_within_anthropics_accepted_subset` (a regression test:
+`required` stays a flat list, and none of `oneOf`/`allOf`/`anyOf` appear
+at the top level of `input_schema` -- fails immediately, before any real
+API call could, if this construct is ever reintroduced),
+`test_done_true_response_satisfies_the_schemas_own_required_list`
+(demonstrates a `{"reasoning": ..., "done": true}` payload still
+satisfies the schema's own `required` list), and
+`test_action_missing_intent_is_not_rejected_by_the_schema_itself`
+(demonstrates the limitation is real, not just asserted in a comment: an
+action-shaped payload missing `intent` is NOT caught by the schema's own
+`required` list either, and separately checks `intent`'s description
+states the rule). The third requested demonstration -- the runtime parser
+actually rejecting a missing-`intent` proposal and bounded recovery
+handling it -- is already exercised by
+`test_missing_intent_produces_a_clean_deterministic_error_and_is_recorded_honestly`
+and `test_malformed_model_output_is_recorded_but_does_not_terminate_the_run`
+in `tests/unit/test_discovery_engine.py` (added in `01f4fff`, unaffected
+by this correction, re-run and still passing) -- not duplicated here, to
+keep this a genuinely minimal correction.
+
+**Verified:** `tests/unit/test_anthropic_tool_schema.py` +
+`tests/unit/test_discovery_engine.py` (35 tests, all passing) run
+directly against the repo. Full deterministic suite `-m "not integration
+and not live_llm"`: 195 passed, 18 deselected (net +1 over `01f4fff`'s
+194: -2 superseded schema tests, +3 new ones), zero regressions. Full
+integration suite (17 tests, unchanged) run for real against a live
+headless browser via the cloud-sandbox tar/stage/extract/venv round-trip,
+checksummed byte-for-byte identical to the device's committed source:
+all pass. No Anthropic call was made for any of this verification or the
+correction itself. Diff reviewed end to end: exactly 2 files changed
+(`discovery/anthropic_client.py`, `tests/unit/test_anthropic_tool_schema.py`)
+-- `discovery/engine.py` has zero diff versus `01f4fff`. The real run
+(`aacd3ecc913d48d8ae9bd88100b93aba`, no trace/intervention exists for it)
+and every previously-preserved real run's log/trace/intervention
+(`d17d9a2fd9a8483c9ca278976f1cf520`,
+`a4dac702e5cd4244ac2c22680834178a`/`ea0efacbd2f2445fb3b01b7345fdd63d`,
+`e199e82bd3774cf6af2124d699ca5cfa`/`0f0b938ecdf04e1181a0564c3fa44e4e`)
+were not touched.
+
+**Separately flagged, not implemented (per explicit instruction): an
+unhandled Anthropic API error currently reaches FastAPI as a bare 500.**
+`AnthropicLLMClient.propose_action`'s `self._client.messages.create(...)`
+call has no try/except around it in `DiscoveryEngine.run()`'s loop, and
+`POST /runs` (`src/cuas/api/main.py`) has no try/except around
+`_orchestrator.run_capability(...)` either -- unlike every other endpoint
+in that file, which maps `KeyError`/`HandoffError` to 404/409. The only
+existing safety net is `RunOrchestrator._run_discovery`'s
+`except Exception: await self._close_surface(...); raise` -- it closes
+the browser surface so nothing leaks, then re-raises unchanged, so the
+exception still reaches FastAPI's default handler as an unstructured 500
+with no `RunResult` ever saved to `_run_store` and no intervention ever
+created. This is a real, verifiable gap against this project's own
+documented error model (`.CLAUDE/06_ERRORS_AND_OBSERVABILITY.md`'s
+"Hard / System Failures" category: these are supposed to surface as
+structured results with a code, e.g. alongside "unrecoverable session
+expiration" or "permission denied" -- an LLM provider rejecting a
+request outright is the same category of thing, just not one the doc
+happens to list by name) -- but it is a different bug class from
+everything fixed in `01f4fff` and this correction (a provider/transport
+failure, not malformed *content* the model returned), and fixing it
+properly means classifying provider errors, deciding what `RunOutcome`/
+HTTP status they map to, and likely creating an intervention/evidence
+path analogous to the malformed-output one -- a distinct, non-trivial
+feature, not a small extension of this fix. Recommendation given to the
+user: worth doing for a production-grade version of this system, but
+implementing it now, unrequested, would be scope creep for this
+correction and arguably for the take-home's remaining scope more broadly;
+left unimplemented pending an explicit decision, per instruction.
