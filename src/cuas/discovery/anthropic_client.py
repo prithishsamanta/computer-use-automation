@@ -34,7 +34,7 @@ from typing import Any
 
 from cuas.discovery.llm_client import LLMClient, LLMResponse
 from cuas.discovery.models import DiscoveryGoal, DiscoveryHistoryEntry
-from cuas.domain import AppContext
+from cuas.domain import AppContext, LocatorStrategy, Target
 from cuas.surface.adapter import Observation
 
 _TOOL_NAME = "propose_action"
@@ -112,6 +112,63 @@ _TOOL_SCHEMA: dict[str, Any] = {
         "required": ["reasoning"],
     },
 }
+
+
+# Bound on a rendered target description folded into a failed history
+# line (see _describe_target) -- keeps it a single short, predictable
+# addition to the prompt regardless of how long a real selector/label
+# gets.
+_MAX_TARGET_DETAIL_CHARS = 120
+
+
+def _quote(value: str) -> str:
+    """Plain double-quoted rendering for prompt text -- not JSON/repr
+    escaping (this is read by a model, not parsed as a literal): embedded
+    double quotes are swapped for single quotes so the description stays
+    readable on one line without backslash noise."""
+    return '"' + value.replace('"', "'") + '"'
+
+
+def _describe_target(target: Target) -> str:
+    """A compact, bounded, typed rendering of a Target's primary locator --
+    enough for the model to know *which* locator it tried (dispatches on
+    LocatorStrategy the same way PlaywrightSurfaceAdapter._playwright_locator
+    does), never the full Target/fallback structure and never
+    `Action.value` (which can carry sensitive user input the model typed,
+    e.g. a member id -- this only ever describes WHERE an action targeted,
+    not what was typed there). Real run 7f8840f08ec34eecaa25e78c696ba134
+    (DECISIONS_LOG.md) showed a failed selector was never included in this
+    history at all, so a stateless next turn had no way to know which
+    locator its own error message was about."""
+
+    locator = target.primary
+    strategy = locator.strategy
+    params = locator.params
+
+    if strategy == LocatorStrategy.ROLE_NAME:
+        name = params.get("name")
+        detail = f"role={_quote(str(params.get('role', '')))}"
+        if name:
+            detail += f" name={_quote(str(name))}"
+    elif strategy == LocatorStrategy.SEMANTIC_ATTRIBUTE:
+        detail = f"{params.get('attribute', '')}={_quote(str(params.get('value', '')))}"
+    elif strategy == LocatorStrategy.LABEL:
+        detail = f"label={_quote(str(params.get('label', '')))}"
+    elif strategy == LocatorStrategy.TEXT_CONTEXT:
+        detail = f"text={_quote(str(params.get('text', '')))}"
+    elif strategy in (LocatorStrategy.STRUCTURAL, LocatorStrategy.CSS):
+        detail = f"selector={_quote(str(params.get('selector', '')))}"
+    elif strategy == LocatorStrategy.XPATH:
+        detail = f"xpath={_quote(str(params.get('xpath', '')))}"
+    elif strategy == LocatorStrategy.COORDINATES:
+        detail = "coordinates"
+    else:
+        detail = "unknown strategy"
+
+    description = f"{strategy.value} {detail}"
+    if len(description) > _MAX_TARGET_DETAIL_CHARS:
+        description = description[:_MAX_TARGET_DETAIL_CHARS] + "..."
+    return description
 
 
 class AnthropicLLMClient(LLMClient):
@@ -198,9 +255,18 @@ class AnthropicLLMClient(LLMClient):
             lines.append("\nHistory so far:")
             for entry in history:
                 detail = f" ({entry.error_message})" if entry.error_message else ""
+                # Only for a genuine execution failure -- not policy
+                # escalations/denials, not "done" turns -- and only when a
+                # target actually exists (a NAVIGATE action has none). This
+                # is deliberately the one extra thing execution_failed
+                # entries carry: which locator the failed action tried,
+                # never `entry.action.value` (see _describe_target).
+                target_detail = ""
+                if entry.outcome == "execution_failed" and entry.action.target is not None:
+                    target_detail = f", target={_describe_target(entry.action.target)}"
                 lines.append(
                     f"- step {entry.step_index}: proposed {entry.action.action_type.value} "
-                    f"(intent={entry.action.intent!r}) -> {entry.outcome}{detail}"
+                    f"(intent={entry.action.intent!r}{target_detail}) -> {entry.outcome}{detail}"
                 )
         lines.append(f"\nCurrent page URL: {observation.url}")
         lines.append(f"Current visible page text:\n{observation.visible_text}")

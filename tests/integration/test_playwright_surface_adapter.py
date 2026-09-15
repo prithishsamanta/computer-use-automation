@@ -106,3 +106,46 @@ async def test_target_not_found_when_every_candidate_fails(demo_app_base_url: st
         target = Target(primary=_css("#this-selector-matches-nothing"))
         with pytest.raises(TargetNotFoundError):
             await surface.read(target)
+
+
+@pytest.mark.asyncio
+async def test_target_not_found_message_includes_sanitized_underlying_cause(demo_app_base_url: str) -> None:
+    """Reproduces the real shape from run 7f8840f08ec34eecaa25e78c696ba134
+    (DECISIONS_LOG.md): a syntactically invalid CSS selector (jQuery-only
+    :contains(), never valid CSS or a valid Playwright selector) against
+    the real demo app. TargetNotFoundError's own message must now carry a
+    real, useful fragment of the underlying Playwright error -- not just a
+    bare "tried N candidate(s)" -- proving the root cause survives
+    PlaywrightSurfaceAdapter._resolve() into the exception's own message
+    instead of only being reachable via __cause__ (which discovery never
+    reads -- see _execute_and_record in engine.py, unmodified here)."""
+
+    async with launch_playwright_surface() as surface:
+        await surface.navigate(demo_app_base_url + "/")
+        await _dismiss_session_notice(surface)
+
+        target = Target(primary=_css("tr:has(td:first-child:contains('Savings')) td:nth-child(3)"))
+        with pytest.raises(TargetNotFoundError) as excinfo:
+            await surface.read(target)
+
+        message = str(excinfo.value)
+        assert "tried 1 candidate(s)" in message
+        assert "last candidate (css) failed:" in message
+        # ":contains()" is a jQuery-only pseudo-class -- never valid CSS and
+        # never a Playwright selector extension -- so depending on the exact
+        # Playwright/browser build this either raises a SyntaxError
+        # immediately or simply never matches anything and times out; either
+        # way, a real, non-empty fragment of Playwright's own message must
+        # now survive into TargetNotFoundError's own message (previously it
+        # stopped at the bare "tried 1 candidate(s)" above, discarding
+        # whichever of these it actually was -- see DECISIONS_LOG.md for run
+        # 7f8840f08ec34eecaa25e78c696ba134).
+        underlying = message.split("last candidate (css) failed:", 1)[1].strip()
+        assert underlying
+        assert underlying.startswith("Locator.wait_for:")
+        # Only the first line -- never Playwright's own multi-line "Call
+        # log:" section that follows it (unbounded, and not root cause).
+        assert "Call log:" not in message
+        # Exception chaining is preserved alongside the new sanitized message
+        # -- a real traceback/debugger still sees the full underlying cause.
+        assert excinfo.value.__cause__ is not None

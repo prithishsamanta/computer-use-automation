@@ -27,6 +27,39 @@ from cuas.surface.adapter import Evidence, Observation, SurfaceAdapter, WaitCond
 # even present", not "wait for the app to catch up".
 FALLBACK_CANDIDATE_TIMEOUT_MS = 1500
 
+# Bound on the sanitized underlying-cause text folded into
+# TargetNotFoundError's own message (see _sanitize_underlying_error) --
+# keeps a single real, useful diagnostic line without ever risking an
+# unbounded dump.
+_MAX_UNDERLYING_ERROR_CHARS = 200
+
+
+def _sanitize_underlying_error(exc: Exception) -> str:
+    """A bounded, single-line rendering of a candidate-resolution
+    exception's own message -- real root cause discovery can learn from
+    (e.g. Playwright's own "SyntaxError: ... is not a valid selector" for
+    an unsupported CSS pseudo-class, or a plain "Timeout Nms exceeded" when
+    nothing matched at all), never a full traceback and never Playwright's
+    own multi-line "Call log:" section that follows it.
+
+    Playwright's Error.__str__() is typically one useful first line (what
+    went wrong) followed by a JS stack trace and/or a "Call log:" block
+    listing each retry -- neither of those is root cause, both can be
+    arbitrarily long, and neither is safe to assume never echoes back
+    page-adjacent text. Taking only the first line and bounding its length
+    keeps this deterministic and small regardless of what Playwright (or
+    any other candidate-resolution failure -- this is deliberately typed
+    as `Exception`, not `PlaywrightError`, since a candidate can fail for
+    non-Playwright reasons too, e.g. a bad params dict) actually raises."""
+
+    text = str(exc).strip()
+    if not text:
+        return "no further detail available"
+    first_line = text.splitlines()[0].strip()
+    if len(first_line) > _MAX_UNDERLYING_ERROR_CHARS:
+        first_line = first_line[:_MAX_UNDERLYING_ERROR_CHARS] + "..."
+    return first_line
+
 
 class PlaywrightSurfaceAdapter(SurfaceAdapter):
     def __init__(self, page: Page):
@@ -65,6 +98,7 @@ class PlaywrightSurfaceAdapter(SurfaceAdapter):
 
         candidates = [target.primary, *target.fallbacks]
         last_error: Exception | None = None
+        last_candidate: Locator | None = None
 
         for candidate in candidates:
             if candidate.strategy == LocatorStrategy.COORDINATES:
@@ -75,10 +109,23 @@ class PlaywrightSurfaceAdapter(SurfaceAdapter):
                 return locator
             except Exception as exc:  # noqa: BLE001 - deliberately broad: any candidate can fail differently
                 last_error = exc
+                last_candidate = candidate
                 continue
 
+        # `last_error`/the last candidate tried are guaranteed set here: the
+        # loop above only ever reaches this line after every non-COORDINATES
+        # candidate's try block raised (a COORDINATES candidate always
+        # returns immediately instead, so it can never be "the last one
+        # tried" at this point). Exception chaining (`from last_error`) is
+        # preserved for anyone reading a real traceback/debugger; the
+        # message itself now also carries a bounded, sanitized summary of
+        # that same cause, since discovery only ever sees str(exc) -- see
+        # DECISIONS_LOG.md for the real run (7f8840f08ec34eecaa25e78c696ba134)
+        # that showed this was previously discarded.
+        assert last_error is not None and last_candidate is not None
         raise TargetNotFoundError(
-            f"Could not resolve target for {action_desc}: tried {len(candidates)} candidate(s)"
+            f"Could not resolve target for {action_desc}: tried {len(candidates)} candidate(s); "
+            f"last candidate ({last_candidate.strategy.value}) failed: {_sanitize_underlying_error(last_error)}"
         ) from last_error
 
     async def navigate(self, url: str) -> None:

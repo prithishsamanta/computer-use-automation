@@ -2221,3 +2221,172 @@ user: worth doing for a production-grade version of this system, but
 implementing it now, unrequested, would be scope creep for this
 correction and arguably for the take-home's remaining scope more broadly;
 left unimplemented pending an explicit decision, per instruction.
+
+### Robustness fix (post-live-LLM-run investigation) -- a real execution failure's root cause and attempted target were discarded before the next stateless LLM turn ever saw them
+
+A read-only inspection of live discovery run `7f8840f08ec34eecaa25e78c696ba134`
+(`data/logs/`, `data/discovery_traces/`) found a genuine execution failure
+handled architecture-consistently but uninformatively: an approved action
+(`discovery-0e94b335`, `read_savings_account_balance`, a CSS selector
+using jQuery's `:contains()` -- never valid CSS or a Playwright selector)
+resumed and executed exactly as approved (confirming, again, all four
+`3904afe` continuation requirements), failed for real, and was correctly
+fed back into `history` for the next turn -- but the model proposed the
+*identical* selector again one step later under a new intent, because
+the feedback it received carried neither which locator had failed nor
+any real detail about why.
+
+Two separate, compounding information-loss points, both upstream of
+`DiscoveryEngine`/`_execute_and_record` (`engine.py`, unmodified by this
+fix -- `git diff --stat -- src/cuas/discovery/engine.py` is empty):
+
+1. **`PlaywrightSurfaceAdapter._resolve()`** (`playwright_adapter.py`)
+   already caught each candidate's real exception as `last_error` and
+   chained it (`raise TargetNotFoundError(...) from last_error`), but
+   `_execute_and_record`'s `except (AutomationError, ValueError) as exc:
+   error_message = str(exc)` only ever sees `TargetNotFoundError`'s own
+   message, never `__cause__` -- so the chained cause, though preserved
+   for a debugger, was silently discarded before it ever reached
+   discovery history at all.
+2. **`AnthropicLLMClient._build_user_message`** rendered each history
+   entry from `action_type`, `intent`, `outcome`, and `error_message`
+   only -- never the actual target/selector the action attempted -- so
+   even a maximally detailed `error_message` would have left the model
+   unable to tell which of its own locators the message was even about.
+
+**Fix, scoped to exactly this feedback boundary, nothing else:**
+
+`playwright_adapter.py` adds `_sanitize_underlying_error(exc)`: a bounded
+(`_MAX_UNDERLYING_ERROR_CHARS = 200`), single-line rendering of a failed
+candidate's own exception message -- first line only (Playwright's
+`Error.__str__()` is one useful line followed by a JS stack trace and/or
+a multi-line, unbounded "Call log:" retry block; neither is root cause,
+neither is safe to assume never echoes page-adjacent text), truncated,
+with a deterministic `"no further detail available"` fallback for an
+empty message. `_resolve()`'s final raise now folds this in alongside the
+failed candidate's strategy name -- `TargetNotFoundError` stays the same
+public/domain type, `from last_error` chaining is preserved unchanged for
+a real traceback/debugger, and no traceback, secret, or arbitrary page
+content is ever persisted -- only Playwright's own short diagnostic
+sentence.
+
+`anthropic_client.py` adds `_describe_target(target)`: a compact,
+bounded (`_MAX_TARGET_DETAIL_CHARS = 120`) rendering of `Target.primary`
+that dispatches on `LocatorStrategy` (mirroring
+`PlaywrightSurfaceAdapter._playwright_locator`'s own dispatch) rather
+than a blind `json.dumps`/`model_dump()` of the full `Target` (which
+would include the unbounded fallback chain and `frame`). `_quote()`
+renders values for prompt readability, not JSON/repr escaping.
+`_build_user_message`'s history loop now appends `target=<description>`
+only when `entry.outcome == "execution_failed"` and
+`entry.action.target is not None` (a `NAVIGATE` action has no target and
+must not crash this) -- deliberately reading only `entry.action.target`,
+never `entry.action.value` (what a `FILL`/similar action actually typed,
+e.g. a raw member id -- unrelated to *where* an action targeted, and the
+one thing that must never ride along here just because target/error
+feedback was added). This is consistent with, not a new gap in,
+`DiscoveryHistoryEntry`'s existing design: its own docstring already
+establishes that `AnthropicLLMClient` needs raw (unredacted) history to
+reason correctly, with redaction applied only at the
+`_redact_history`/persistence boundary in `engine.py` -- unchanged here.
+
+Nothing here is `:contains()`-specific, Savings-specific, demo-app-
+specific, or teaches the model any CSS/Playwright syntax -- both new
+functions operate purely on `Exception`/`Target`/`LocatorStrategy`, the
+same generic types every other action/locator in the system already
+uses.
+
+**Example -- the existing failed step, as the next stateless LLM turn
+would now see it** (reconstructed from the real values in
+`data/discovery_traces/7f8840f08ec34eecaa25e78c696ba134.json`; that
+trace/log file itself was not modified by this fix -- read-only
+throughout):
+
+```
+- step 1: proposed read (intent='read_savings_account_balance', target=css selector="tr:has(td:first-child:contains('Savings')) td:nth-child(3)") -> execution_failed (Could not resolve target for read: tried 1 candidate(s); last candidate (css) failed: Locator.wait_for: <Playwright's own real diagnostic -- see Verified below for which shape this environment actually produced for this exact selector>)
+```
+
+Previously this line stopped at `-> execution_failed (Could not resolve
+target for read: tried 1 candidate(s))` -- no target, no underlying
+cause at all.
+
+**Explicitly out of scope for this fix (per instruction), all
+unchanged:** `max_duration_seconds` resume behavior; `_action_signature`/
+repeat detection; discovery budgets; an intent allowlist; policy
+behavior; the currently-pending intervention
+(`76737908f0564b31b3b123712ca74960`, re-verified `status: "pending"`,
+`claimed_by: None`, `resolved_at: None` both before and after this fix)
+was not manually repaired or replaced; prompts were not changed to teach
+the model CSS/Playwright syntax; provider-error handling (the separately
+flagged, still-unimplemented Anthropic-500 gap noted in the correction
+above) was not touched.
+
+**Tests:** `tests/unit/test_playwright_adapter_error_sanitization.py`
+(new, 4 tests) -- `_sanitize_underlying_error` takes only the first line
+of a multi-line message, truncates a long first line to
+`_MAX_UNDERLYING_ERROR_CHARS` with a `...` suffix, falls back
+deterministically on an empty message, and strips surrounding
+whitespace. `tests/unit/test_anthropic_user_message.py` (new, 13 tests)
+-- `_quote`'s double-quote-to-single-quote swap; `_describe_target` for
+every `LocatorStrategy` variant (`css`, `role_name` with/without a
+`name`, `label`, `xpath`, `coordinates` -- confirmed it never leaks raw
+coordinate values) and its truncation; `_build_user_message` includes
+`target=...` only for `execution_failed` entries and never for
+`executed`/`policy_denied`/`approval_required`; a `NAVIGATE` action with
+`target=None` produces no `target=` and does not crash; and -- the
+sensitive-value proof the instruction specifically asked for -- a `FILL`
+action's `Action.value` (a stand-in raw, secret-looking string) never
+appears in the rendered message even when that same entry is
+`execution_failed` and does get a `target=` rendering. One test locks in
+the exact real history line for run `7f8840f08ec34eecaa25e78c696ba134`'s
+step 1 byte-for-byte. `tests/integration/test_playwright_surface_adapter.py`
+gains `test_target_not_found_message_includes_sanitized_underlying_cause`
+(new) -- reproduces the real run's exact selector against a real browser
+and real demo app and asserts the sanitized message is non-empty, always
+begins with `Locator.wait_for:`, and never contains Playwright's own
+multi-line `Call log:` block; deliberately does *not* assert a specific
+underlying error *type* (see Verified below for why).
+
+**Verified:** Full deterministic suite (`-m "not integration and not
+live_llm"`): 212 passed, 19 deselected (net +17 over `68c952d`'s 195: the
+17 new unit tests above), zero regressions -- run both directly against
+the device repo and, byte-for-byte checksum-verified identical, via the
+cloud-sandbox tar/stage/extract/venv round-trip. `tests/unit/
+test_discovery_engine.py` (all 32 tests, covering both `01f4fff`'s
+malformed-output recovery and `3904afe`'s approval/resume continuation)
+re-run explicitly and confirmed passing unchanged, since neither behavior
+was touched. Full integration suite (18 tests -- the pre-existing 17 plus
+the 1 new one above) run for real against a live headless browser via
+that same checksummed round-trip: all pass.
+
+One real finding from running the new integration test for real, worth
+recording rather than silently working around: the exact real Playwright
+error this environment's browser build produces for the live run's exact
+selector turned out to be `Locator.wait_for: Timeout 1500ms exceeded.` --
+a plain timeout, not the `SyntaxError: ... is not a valid selector.` an
+earlier isolated (non-integration, non-demo-app) sandbox check had
+suggested. `:contains()` is a jQuery-only pseudo-class -- never valid CSS
+and never a Playwright selector extension -- so whether a given
+Playwright/browser build rejects it outright or simply never matches
+anything and times out is a real, build-dependent difference, not a bug
+in this fix; the original live run's own actual underlying exception type
+was never recorded by the old code either (that's precisely the bug this
+fix closes), so it cannot be recovered now. The integration test and this
+log entry were both written to assert only what is actually guaranteed
+regardless of that difference -- a real, non-empty, single-line fragment
+of Playwright's own diagnostic survives, bounded, with the retry-log
+noise excluded -- rather than assuming one specific exception shape.
+
+No Anthropic call was made for any part of this investigation,
+implementation, or verification. `data/interventions/
+76737908f0564b31b3b123712ca74960.json`, `data/logs/
+7f8840f08ec34eecaa25e78c696ba134.jsonl`, `data/discovery_traces/
+7f8840f08ec34eecaa25e78c696ba134.json`, and every other previously-
+preserved real run's evidence/trace/intervention/log were read-only
+throughout and were not modified. Diff reviewed end to end: exactly 5
+files touched -- 2 source (`src/cuas/surface/playwright_adapter.py`,
+`src/cuas/discovery/anthropic_client.py`), 1 modified test
+(`tests/integration/test_playwright_surface_adapter.py`), 2 new test
+files (`tests/unit/test_playwright_adapter_error_sanitization.py`,
+`tests/unit/test_anthropic_user_message.py`) -- no unintended changes,
+no secrets, no page content, no full tracebacks persisted anywhere.
