@@ -18,7 +18,15 @@ from cuas.observability import EventType
 from cuas.safety import LayeredPolicyEngine
 from cuas.surface.adapter import Evidence, Observation, WaitCondition, WaitConditionKind
 from cuas.artifact.schema import BusinessOutcome
-from tests.fixtures.fake_llm_client import FakeLLMClient, css_target, malformed, propose, propose_done, role_target
+from tests.fixtures.fake_llm_client import (
+    FakeLLMClient,
+    css_target,
+    malformed,
+    propose,
+    propose_done,
+    propose_missing_intent,
+    role_target,
+)
 from tests.fixtures.fake_surface import FakeSurfaceAdapter
 from tests.fixtures.in_memory_event_sink import InMemoryEventSink
 
@@ -72,22 +80,166 @@ async def test_normal_successful_discovery_executes_allowed_actions_and_stops_on
     assert "M1001" not in repr(result.history)
 
 
+# ---------------------------------------------------------------------------
+# Malformed model output -- bounded recovery, not immediate termination
+# (DECISIONS_LOG.md: a real Anthropic run, e199e82bd3774cf6af2124d699ca5cfa,
+# omitted `intent` and the run terminated on the very first malformed
+# turn). Supersedes the old
+# test_malformed_model_output_stops_immediately_without_retry, which
+# asserted exactly the behavior this change replaces.
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_malformed_model_output_stops_immediately_without_retry() -> None:
-    """No repair attempt, no second call to the model -- exactly one
-    scripted response is consumed."""
+async def test_malformed_model_output_is_recorded_but_does_not_terminate_the_run() -> None:
+    """A single malformed proposal is recorded and the loop asks the model
+    again instead of ending the run -- three scripted turns (malformed,
+    a corrected READ, done) all get consumed, and the run succeeds."""
 
     fake = FakeSurfaceAdapter()
-    llm = FakeLLMClient(malformed("<garbage>"))
     sink = InMemoryEventSink()
+    llm = FakeLLMClient(
+        propose_missing_intent("read", target=role_target("text", "Savings Balance")),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+        propose_done("recovered"),
+    )
 
     result = await _engine(fake, llm, event_sink=sink).run(_goal(), CONTEXT)
 
-    assert result.status == DiscoveryStatus.MALFORMED_MODEL_OUTPUT
-    assert result.steps_taken == 0
-    assert result.error_message is not None
+    assert result.status == DiscoveryStatus.SUCCESS
+    assert len(llm.calls) == 3
     assert len(sink.events_of(EventType.MALFORMED_MODEL_OUTPUT)) == 1
     assert len(sink.events_of(EventType.RUN_COMPLETED)) == 1
+    # No fabricated Action/history entry for the malformed turn -- only
+    # the genuinely executed READ is in history.
+    assert len(result.history) == 1
+    assert result.history[0].action.action_type == ActionType.READ
+
+
+@pytest.mark.asyncio
+async def test_missing_intent_produces_a_clean_deterministic_error_and_is_recorded_honestly(tmp_path) -> None:
+    """Reproduces real run e199e82bd3774cf6af2124d699ca5cfa's exact step 1
+    shape: a structurally-present proposal missing `intent`. The parser
+    must raise a clean, deterministic message instead of leaking Python's
+    bare KeyError formatting, and DiscoveryTrace must keep recording the
+    malformed turn exactly as before: raw output, parsed_action=None, the
+    parse error, outcome="malformed_model_output" -- nothing here may
+    rewrite or fabricate the proposal."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(
+        propose_missing_intent("read", target=css_target("table tr:has(td:first-child:contains('Savings')) td:nth-child(3)")),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+        propose_done("recovered"),
+    )
+    trace_store = FileDiscoveryTraceStore(tmp_path)
+
+    result = await _engine(fake, llm, trace_store=trace_store).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.SUCCESS
+    loaded = trace_store.load(result.run_id)
+    malformed_step = loaded.steps[0]
+    assert malformed_step.outcome == "malformed_model_output"
+    assert malformed_step.parsed_action is None
+    assert malformed_step.parse_error == "malformed action proposal: missing required field: intent"
+    assert "'intent'" not in malformed_step.parse_error  # no bare KeyError formatting leaked through
+    assert malformed_step.raw_model_output is not None
+    assert "contains" in malformed_step.raw_model_output  # the real, uncorrected proposal is preserved
+
+
+@pytest.mark.asyncio
+async def test_malformed_proposal_never_executes_or_reaches_policy(tmp_path) -> None:
+    """Proposing an unclassified/consequential-looking intent while
+    malformed must not somehow execute it or reach policy: if it did, this
+    run would either see a real click against the surface or escalate to
+    APPROVAL_REQUIRED instead of recovering and succeeding."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(
+        propose_missing_intent("click", target=role_target("button", "Close Account")),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+        propose_done("recovered"),
+    )
+    trace_store = FileDiscoveryTraceStore(tmp_path)
+
+    result = await _engine(fake, llm, trace_store=trace_store).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.SUCCESS
+    assert not any(call[0] == "click" for call in fake.calls)
+    loaded = trace_store.load(result.run_id)
+    assert loaded.steps[0].policy_decision is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_feedback_reaches_only_the_next_model_call_not_the_trace(tmp_path) -> None:
+    """The corrective parse-error text must appear in the very next call's
+    observation only -- never the first call's, never a third call's once
+    it has already been shown once -- and it must never leak into the
+    persisted trace's observation excerpt, which stays an honest record of
+    what the page actually showed (mirrors _PROGRESS_REMINDER_TEXT's own
+    separation)."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(
+        propose_missing_intent("read", target=role_target("text", "Savings Balance")),
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),
+        propose_done("recovered"),
+    )
+    trace_store = FileDiscoveryTraceStore(tmp_path)
+
+    result = await _engine(fake, llm, trace_store=trace_store).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.SUCCESS
+    assert "could not be parsed" not in llm.calls[0][2].visible_text
+    assert "could not be parsed" in llm.calls[1][2].visible_text
+    assert "could not be parsed" not in llm.calls[2][2].visible_text
+
+    loaded = trace_store.load(result.run_id)
+    assert all("could not be parsed" not in step.observation_text_excerpt for step in loaded.steps)
+
+
+@pytest.mark.asyncio
+async def test_corrected_proposal_after_malformed_turn_still_requires_approval_when_unclassified() -> None:
+    """Recovering from a malformed turn grants no special policy
+    treatment to whatever the model proposes next -- an unclassified
+    intent (close_account) still escalates exactly as it would from a
+    completely clean run, and DiscoveryPendingApproval still captures the
+    exact corrected action (3904afe semantics untouched)."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(
+        propose_missing_intent("click", target=role_target("button", "Close Account")),
+        propose("click", "close_account", target=role_target("button", "Close Account")),
+    )
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.APPROVAL_REQUIRED
+    assert not any(call[0] == "click" for call in fake.calls)
+    assert result.pending_approval is not None
+    assert result.pending_approval.pending_action.intent == "close_account"
+
+
+@pytest.mark.asyncio
+async def test_persistent_malformed_output_is_bounded_by_max_steps_and_escalates() -> None:
+    """No separate malformed-retry cap exists -- the existing max_steps
+    budget alone bounds unrecovered malformed output, and exhaustion still
+    escalates through the normal terminal path. The exhaustion reason
+    reports how many of the consumed steps were malformed."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(
+        propose_missing_intent("read", target=role_target("text", "A")),
+        propose_missing_intent("read", target=role_target("text", "B")),
+        propose_missing_intent("read", target=role_target("text", "C")),
+    )
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT, DiscoveryLimits(max_steps=3))
+
+    assert result.status == DiscoveryStatus.MAX_STEPS_EXCEEDED
+    assert result.steps_taken == 3
+    assert len(llm.calls) == 3  # never asked for a 4th turn once the budget is spent
+    assert result.error_message == "exceeded max_steps=3 (3 of them malformed model output)"
 
 
 @pytest.mark.asyncio

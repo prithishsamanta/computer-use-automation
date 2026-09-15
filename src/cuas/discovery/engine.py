@@ -123,6 +123,46 @@ _PROGRESS_REMINDER_TEXT = (
 )
 
 
+def _require_field(source: dict[str, Any], key: str) -> Any:
+    """Same purpose as `source[key]`, except a missing key raises a
+    deterministic ValueError message instead of a bare KeyError -- whose
+    str() is just the key's repr (e.g. "'intent'"), which used to leak
+    straight into "malformed action proposal: 'intent'" (DECISIONS_LOG.md).
+    `KeyError` stays in `_parse_proposal`/`_parse_target`'s except clause
+    regardless, as defense in depth for any dict access not routed through
+    this helper."""
+    if key not in source:
+        raise ValueError(f"missing required field: {key}")
+    return source[key]
+
+
+# Fed back the same way as _PROGRESS_REMINDER_TEXT above (next turn's
+# *observation* only, never the persisted trace/observation fields), but
+# for a different corrective case: the model's previous response could not
+# even be parsed into an Action at all (see DiscoveryEngine._parse_proposal).
+# Unlike the progress reminder, this describes one specific past mistake,
+# not a standing rule, so the loop clears it back to None immediately after
+# building the one observation that carries it (see `run`'s per-iteration
+# observation_for_model construction).
+def _build_malformed_feedback_text(parse_error: str) -> str:
+    return (
+        "Your previous response could not be parsed as a valid action "
+        f"proposal: {parse_error}. That turn was not executed and nothing "
+        "was recorded as an action. Propose exactly one action again, using "
+        "this tool's schema, with every field this action type requires."
+    )
+
+
+def _with_malformed_count(reason: str, malformed_count: int) -> str:
+    """Appends how many of the consumed steps were malformed-model-output
+    turns to a budget-exhaustion reason, when at least one occurred -- an
+    escalation-evidence quality improvement only; it never changes whether
+    or when exhaustion happens (DECISIONS_LOG.md)."""
+    if malformed_count <= 0:
+        return reason
+    return f"{reason} ({malformed_count} of them malformed model output)"
+
+
 class DiscoveryEngine:
     def __init__(
         self,
@@ -160,7 +200,22 @@ class DiscoveryEngine:
         own budgets/counters are restored rather than reset, and the
         existing discovery trace for this run_id is appended to instead
         of being overwritten. `None` (the default) is byte-for-byte the
-        original behavior: a fresh attempt from goal.start_url."""
+        original behavior: a fresh attempt from goal.start_url.
+
+        A single malformed model proposal (unparseable JSON, a missing
+        required field, an invalid enum value, etc. -- see
+        `_parse_proposal`) is not terminal by itself: it is recorded
+        honestly in the trace, never executed, never sent to policy, and
+        never turned into a DiscoveryHistoryEntry (there is no valid Action
+        to put in one) -- but the loop continues, with a concise, redacted
+        description of the parse error fed back on the very next turn's
+        observation only (see `pending_malformed_feedback`/
+        `_build_malformed_feedback_text`), consuming one of the existing
+        max_steps/max_duration_seconds/max_total_tokens bounds exactly like
+        any other turn. Persistent malformed output still terminates and
+        escalates once those bounds are exhausted, exactly as before (see
+        DECISIONS_LOG.md).
+        """
 
         run_id = run_id or uuid.uuid4().hex
         limits = limits or DiscoveryLimits()
@@ -226,6 +281,18 @@ class DiscoveryEngine:
             # there is nothing to reset.
             needs_progress_reminder = False
 
+        # Not part of DiscoveryPendingApproval (3904afe) by design -- a
+        # malformed proposal can never be the pending_action of an approval
+        # escalation (see _parse_proposal's contract: parse_error implies
+        # action is None, so the loop below never reaches self._policy.
+        # evaluate() for it), and this state is purely same-run
+        # bookkeeping/feedback, not something an operator's approval needs
+        # to carry across a pause. Always starts fresh, including on a
+        # resumed run -- if a resumed run also produces malformed output, it
+        # is bounded and reported exactly like a fresh run's would be.
+        malformed_count = 0
+        pending_malformed_feedback: str | None = None
+
         start_time = self._clock()
         result: DiscoveryResult | None = None
 
@@ -277,7 +344,9 @@ class DiscoveryEngine:
             if self._clock() - start_time > limits.max_duration_seconds:
                 result = self._finish(
                     run_id, DiscoveryStatus.MAX_DURATION_EXCEEDED, goal, step_index, history,
-                    reason=f"exceeded max_duration_seconds={limits.max_duration_seconds}",
+                    reason=_with_malformed_count(
+                        f"exceeded max_duration_seconds={limits.max_duration_seconds}", malformed_count
+                    ),
                 )
                 await self._capture_terminal_evidence(run_id, step_index, "max_duration_exceeded")
                 break
@@ -302,8 +371,20 @@ class DiscoveryEngine:
             observation_for_model = observation
             if needs_progress_reminder:
                 observation_for_model = Observation(
-                    url=observation.url, visible_text=observation.visible_text + "\n\n" + _PROGRESS_REMINDER_TEXT
+                    url=observation_for_model.url,
+                    visible_text=observation_for_model.visible_text + "\n\n" + _PROGRESS_REMINDER_TEXT,
                 )
+            if pending_malformed_feedback is not None:
+                observation_for_model = Observation(
+                    url=observation_for_model.url,
+                    visible_text=observation_for_model.visible_text
+                    + "\n\n"
+                    + _build_malformed_feedback_text(pending_malformed_feedback),
+                )
+                # Consumed exactly once -- this describes one specific past
+                # mistake, not a standing rule like _PROGRESS_REMINDER_TEXT,
+                # so it must not keep reappearing on every later turn.
+                pending_malformed_feedback = None
 
             llm_response = await self._llm.propose_action(
                 goal=goal, context=context, observation=observation_for_model, history=history
@@ -322,7 +403,9 @@ class DiscoveryEngine:
                 trace.steps.append(trace_step)
                 result = self._finish(
                     run_id, DiscoveryStatus.MAX_TOKENS_EXCEEDED, goal, step_index, history,
-                    reason=f"exceeded max_total_tokens={limits.max_total_tokens}",
+                    reason=_with_malformed_count(
+                        f"exceeded max_total_tokens={limits.max_total_tokens}", malformed_count
+                    ),
                 )
                 break
 
@@ -332,15 +415,26 @@ class DiscoveryEngine:
                 trace_step.parse_error = redact_named_values(parse_error, named_values)
                 trace_step.outcome = "malformed_model_output"
                 trace.steps.append(trace_step)
+                malformed_count += 1
+                # Fed back on the *next* turn's observation only (see the
+                # observation_for_model construction above) -- never a
+                # DiscoveryHistoryEntry (action is required there and there
+                # is no valid Action to put in it; see DECISIONS_LOG.md) and
+                # never a rewrite of what was actually recorded above. This
+                # turn genuinely never executed and never reached policy --
+                # nothing here changes that.
+                pending_malformed_feedback = trace_step.parse_error
                 self._emit(
                     run_id, EventType.MALFORMED_MODEL_OUTPUT, step_id=str(step_index), status="failure",
-                    details={"parse_error": trace_step.parse_error},
+                    details={"parse_error": trace_step.parse_error, "malformed_count": malformed_count},
                 )
-                await self._capture_terminal_evidence(run_id, step_index, "malformed_model_output")
-                result = self._finish(
-                    run_id, DiscoveryStatus.MALFORMED_MODEL_OUTPUT, goal, step_index, history, reason=parse_error
-                )
-                break
+                # Bounded by the same max_steps/max_duration_seconds/
+                # max_total_tokens limits as every other kind of turn --
+                # deliberately no separate malformed-retry cap
+                # (DECISIONS_LOG.md). If the model never recovers, the
+                # budgets above/below still terminate and escalate this run
+                # exactly as they already do for any other stuck loop.
+                continue  # noqa: consecutive-repeat/signature tracking intentionally not updated -- no Action exists to sign
 
             if done:
                 trace_step.outcome = "declared_done"
@@ -460,7 +554,7 @@ class DiscoveryEngine:
         else:
             result = self._finish(
                 run_id, DiscoveryStatus.MAX_STEPS_EXCEEDED, goal, limits.max_steps, history,
-                reason=f"exceeded max_steps={limits.max_steps}",
+                reason=_with_malformed_count(f"exceeded max_steps={limits.max_steps}", malformed_count),
             )
             await self._capture_terminal_evidence(run_id, limits.max_steps, "max_steps_exceeded")
 
@@ -489,8 +583,8 @@ class DiscoveryEngine:
             return None, True, None
 
         try:
-            action_type = ActionType(proposal["action_type"])
-            intent = proposal["intent"]
+            action_type = ActionType(_require_field(proposal, "action_type"))
+            intent = _require_field(proposal, "intent")
             if not isinstance(intent, str) or not intent.strip():
                 raise ValueError("intent must be a non-empty string")
 
@@ -526,11 +620,11 @@ class DiscoveryEngine:
             raise ValueError(f"unsupported locator strategy from model: {strategy.value}")
 
         if strategy == LocatorStrategy.ROLE_NAME:
-            params: dict[str, Any] = {"role": target_dict["role"]}
+            params: dict[str, Any] = {"role": _require_field(target_dict, "role")}
             if target_dict.get("name"):
                 params["name"] = target_dict["name"]
         else:
-            params = {"selector": target_dict["selector"]}
+            params = {"selector": _require_field(target_dict, "selector")}
 
         return Target(primary=Locator(strategy=strategy, params=params, frame=target_dict.get("frame")))
 

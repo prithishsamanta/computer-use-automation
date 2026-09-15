@@ -25,7 +25,7 @@ import pytest
 
 from cuas.artifact import ArtifactRepository, FileArtifactRepository
 from cuas.capability import CapabilityRecord, CapabilityService, CapabilityStatus, FileCapabilityRepository
-from cuas.discovery import DiscoveryGoal, DiscoveryTraceStore, FileDiscoveryTraceStore
+from cuas.discovery import DiscoveryGoal, DiscoveryLimits, DiscoveryTraceStore, FileDiscoveryTraceStore
 from cuas.domain import AppContext, Locator, LocatorStrategy, Target
 from cuas.handoff import InMemoryInterventionRepository
 from cuas.orchestration import RunOrchestrator, RunOutcome
@@ -447,7 +447,13 @@ class TestDiscoveryPath:
     async def test_discovery_hard_failure_creates_intervention(
         self, capability_service: CapabilityService, artifact_repo: ArtifactRepository, trace_store: DiscoveryTraceStore
     ) -> None:
-        llm = FakeLLMClient(malformed())
+        """A malformed proposal alone no longer terminates discovery (see
+        DECISIONS_LOG.md/test_discovery_engine.py) -- it takes a bounded
+        run that never recovers to still hit a hard failure, so this
+        scripts enough malformed turns to exhaust a small max_steps budget
+        rather than a single one."""
+
+        llm = FakeLLMClient(malformed(), malformed())
         interventions = InMemoryInterventionRepository()
         orchestrator = RunOrchestrator(
             capability_service,
@@ -457,6 +463,7 @@ class TestDiscoveryPath:
             interventions,
             trace_store,
             llm=llm,
+            discovery_limits=DiscoveryLimits(max_steps=2),
         )
 
         result = await orchestrator.run_capability(

@@ -1909,3 +1909,198 @@ exactly the 8 intended files changed (`discovery/models.py`,
 every other live-session field. The real run
 (`a4dac702e5cd4244ac2c22680834178a`) and its intervention
 (`ea0efacbd2f2445fb3b01b7345fdd63d`, still `pending`) were not touched.
+### Robustness fix (post-live-LLM-run investigation) -- malformed model output was needlessly terminal and leaked a raw KeyError message
+
+**Symptom (real Anthropic call, run `e199e82bd3774cf6af2124d699ca5cfa`,
+capability `discover_savings_balance_demo`):** step 0 was a correctly
+rejected premature `done=true` (the materializable-progress gate above
+working exactly as intended). Step 1 proposed `{"action_type": "read",
+"reasoning": "...", "target": {"strategy": "css", "selector": "table
+tr:has(td:first-child:contains('Savings')) td:nth-child(3)"}}` -- a real,
+structurally valid tool_use block that simply omitted `intent`.
+`_parse_proposal`'s `intent = proposal["intent"]` raised a bare
+`KeyError('intent')`, whose `str()` is just `'intent'`, producing
+`"malformed action proposal: 'intent'"` and terminating the run
+immediately with `DiscoveryStatus.MALFORMED_MODEL_OUTPUT` -- one
+uninspected turn, no retry, an intervention created
+(`0f0b938ecdf04e1181a0564c3fa44e4e`) for something a corrected next turn
+could very plausibly have resolved on its own. This real run (its log,
+trace, and intervention record) was inspected read-only and is preserved
+exactly as captured; the intervention was never approved/resumed/claimed
+and remains `pending`.
+
+**Root cause, found on inspection (read-only investigation, reported
+before any code changed):** two independent, compounding causes. (1) The
+schema contract sent to Anthropic (`AnthropicLLMClient._TOOL_SCHEMA`) never
+actually required `intent`: `input_schema["required"]` was `["reasoning"]`
+only, and `intent`'s own free-text description never said "required"
+anywhere (unlike `target`'s and `value`'s descriptions, which do) -- the
+model omitting it was consistent with the schema as written, not a
+violation of it. (2) Separately, `_parse_proposal`'s validation treated
+*any* malformed turn -- one bad field among many possible causes (invalid
+JSON, a missing field, an invalid enum value, a bad locator strategy) -- as
+instantly terminal, with no chance for the model to see its own mistake
+and correct it, which sits in tension with this project's own documented
+philosophy (`.CLAUDE/04_SAFETY_AND_HUMAN_HANDOFF.md`: "Do not escalate on
+the first transient failure... Escalate when: bounded safe recovery is
+exhausted..."; `.CLAUDE/03_DISCOVERY_AND_REPLAY.md`'s Replay Recovery
+pattern: classify -> attempt only safe, bounded recovery -> retry ->
+re-check -> escalate only if still unresolved). Neither doc ever mandated
+immediate termination for discovery specifically -- it was a deliberate,
+explicitly tested Phase 8 choice
+(`test_malformed_model_output_stops_immediately_without_retry`), not an
+oversight, just one this real run showed to be worth revisiting.
+
+**The fix -- narrowly scoped, per instruction:**
+
+*Contract:* `_TOOL_SCHEMA["input_schema"]` now declares `"anyOf":
+[{"required": ["done"]}, {"required": ["intent"]}]` alongside the existing
+`"required": ["reasoning"]` -- `intent` couldn't simply move into the flat
+`required` array because a `done=true` response legitimately omits it;
+this says "reasoning always required, and additionally either a done claim
+or intent present," the smallest way to make intent required for exactly
+the case `_parse_proposal` already treats as required. `intent`'s
+description also now says so explicitly. Anthropic tool-use does not
+hard-enforce this schema server-side the way strict/structured outputs
+do, so `_parse_proposal`'s own runtime validation is kept unchanged as
+defense in depth -- schema enforcement was added, not substituted.
+
+*Bounded recovery:* the malformed branch in `DiscoveryEngine.run()`'s loop
+no longer calls `_capture_terminal_evidence`/`_finish`/`break`. It still
+does everything it did before (redact and append the `DiscoveryTraceStep`
+with `parse_error`, `parsed_action=None`, `outcome="malformed_model_output"`,
+emit `EventType.MALFORMED_MODEL_OUTPUT`), then increments a new loop-local
+`malformed_count` and sets a new loop-local `pending_malformed_feedback`
+to the already-redacted parse error, then `continue`s the same `for
+step_index in range(start_step, limits.max_steps)` loop -- so a malformed
+turn consumes one step of the existing budget exactly like a rejected
+"done" claim already does, with no new retry cap (none was added, per
+instruction). On the very next iteration, `observation_for_model` gets a
+new corrective paragraph appended (`_build_malformed_feedback_text`,
+mirroring the existing `_PROGRESS_REMINDER_TEXT` ephemeral-injection
+pattern exactly: appended to the *copy* of the observation sent to the
+model only, never to `observation` itself or anything derived into the
+persisted trace), and `pending_malformed_feedback` is cleared back to
+`None` immediately after -- it describes one specific past mistake, not a
+standing rule, so it must not keep reappearing on later turns the way the
+progress reminder deliberately does. The malformed turn is never turned
+into a `DiscoveryHistoryEntry` (that type's `action: Action` field stays
+required, unchanged, per instruction -- there is no valid `Action` to put
+in one, and nothing was fabricated to make one fit) and never reaches
+`self._policy.evaluate()` -- both exactly as before. A corrected next
+proposal goes through the completely normal path: parsed, checked for
+loop/repetition, evaluated by `LayeredPolicyEngine` with no special
+treatment (verified by a new test: an unclassified intent proposed right
+after a malformed turn still escalates to `APPROVAL_REQUIRED` and still
+produces a normal `DiscoveryPendingApproval`, exactly as a completely
+clean run would). If malformed output never recovers, the existing
+`max_steps`/`max_duration_seconds`/`max_total_tokens` bounds terminate and
+escalate the run exactly as they already do for any other stuck loop --
+`MAX_STEPS_EXCEEDED`/`MAX_DURATION_EXCEEDED`/`MAX_TOKENS_EXCEEDED`, still
+via `_capture_terminal_evidence` and `RunOrchestrator`'s existing generic
+intervention-creation fallback, unchanged. Each of those three exhaustion
+reasons now runs through a new `_with_malformed_count` helper that appends
+`" (N of them malformed model output)"` when `malformed_count > 0`, purely
+for escalation-evidence quality -- it never changes whether or when
+exhaustion happens.
+
+One deliberate, narrow side effect: `DiscoveryStatus.MALFORMED_MODEL_OUTPUT`
+(the terminal status) is no longer ever produced by `DiscoveryEngine.run()`
+-- persistent malformed output now always surfaces as one of the three
+budget-exhaustion statuses instead. The enum value itself was left in
+place (removing it was not asked for and is a larger, unrelated cleanup);
+`EventType.MALFORMED_MODEL_OUTPUT` is unaffected and still emitted once
+per malformed occurrence, terminal or not.
+
+*Interaction with `3904afe`'s `DiscoveryPendingApproval`:* confirmed
+unchanged and untouched -- `malformed_count`/`pending_malformed_feedback`
+are plain loop-local variables, never added to `DiscoveryPendingApproval`
+or `AutomationSession`, and always start fresh (including on a `resume`d
+run) since a malformed proposal can never be the `pending_action` of an
+approval escalation in the first place (`_parse_proposal` returns
+`action=None` whenever `parse_error` is set, so the loop never reaches
+`self._policy.evaluate()` -- the only place a `DiscoveryPendingApproval` is
+built -- for a malformed turn). Every existing approval/resume test from
+`3904afe` passes unchanged.
+
+*Error-message quality:* a new `_require_field(source, key)` helper
+replaces the four unchecked `dict["key"]` accesses that used to rely on
+Python's bare `KeyError` formatting (`proposal["action_type"]`,
+`proposal["intent"]` in `_parse_proposal`; `target_dict["role"]`,
+`target_dict["selector"]` in `_parse_target`), raising
+`ValueError(f"missing required field: {key}")` instead. `KeyError` stays
+in both methods' `except` clauses regardless, as defense in depth for any
+access not routed through the helper. This changes only the resulting
+string (`"malformed action proposal: 'intent'"` ->
+`"malformed action proposal: missing required field: intent"`), never
+which cases are caught or when the branch fires.
+
+**Deliberately not done (explicit scope, per instruction):** no separate
+malformed-retry cap or counter-based bound was added -- the existing
+`max_steps`/`max_duration_seconds`/`max_total_tokens` limits are relied on
+as-is. No repair/sanitization of the model's invalid `:contains()`
+selector (still genuinely invalid CSS/Playwright syntax; a corrected
+retry still has to come from the model itself). No `read_savings_account_balance`-style
+intent allowlist was added -- an unclassified intent proposed after
+recovering from a malformed turn still fails closed to
+`REQUIRE_APPROVAL`. No inference or fabrication of `intent` or any other
+missing field anywhere. `DiscoveryHistoryEntry.action` was not made
+optional. No change to `claim_intervention`/`mark_human_control_complete`/
+`resume_run` or any `InterventionStatus`/`ControlState` state machine. No
+Anthropic call was made anywhere in this work. No modification to
+`e199e82bd3774cf6af2124d699ca5cfa`'s log/trace, or to intervention
+`0f0b938ecdf04e1181a0564c3fa44e4e` (confirmed still `pending`,
+byte-identical to before this work), or to any earlier-preserved evidence
+set (`d17d9a2fd9a8483c9ca278976f1cf520`,
+`a4dac702e5cd4244ac2c22680834178a`/`ea0efacbd2f2445fb3b01b7345fdd63d`).
+
+**Tests added/updated:** `tests/fixtures/fake_llm_client.py` gained
+`propose_missing_intent(...)`, a scriptable helper producing the exact
+real shape (a structurally valid tool_use payload missing `intent`),
+distinct from the pre-existing `malformed()` helper (which models the
+*other* malformed case: no structured proposal at all). New
+`tests/unit/test_anthropic_tool_schema.py` (schema-only, no `live_llm`
+mark, no API key/network needed --
+`test_intent_is_required_for_every_non_done_action_proposal`,
+`test_intent_description_states_it_is_required`).
+`tests/unit/test_discovery_engine.py`: replaced
+`test_malformed_model_output_stops_immediately_without_retry` (asserted
+exactly the old terminal-on-first-occurrence contract) with
+`test_malformed_model_output_is_recorded_but_does_not_terminate_the_run`,
+`test_missing_intent_produces_a_clean_deterministic_error_and_is_recorded_honestly`,
+`test_malformed_proposal_never_executes_or_reaches_policy`,
+`test_malformed_feedback_reaches_only_the_next_model_call_not_the_trace`,
+`test_corrected_proposal_after_malformed_turn_still_requires_approval_when_unclassified`,
+`test_persistent_malformed_output_is_bounded_by_max_steps_and_escalates`.
+`tests/unit/test_run_orchestrator.py::test_discovery_hard_failure_creates_intervention`
+updated (a single malformed proposal is no longer terminal, so it now
+scripts two malformed turns against a `DiscoveryLimits(max_steps=2)`
+orchestrator to still exhaust the bound and still assert a hard failure
+creates an intervention). All pre-existing "done"-rejection tests
+(`test_rejected_done_feeds_back_corrective_context_and_accepts_a_read`,
+`test_done_after_a_materializable_read_succeeds`, etc.) and all
+`3904afe` approval/resume tests were run unchanged and still pass.
+
+**Verified:** `tests/unit/test_discovery_engine.py` +
+`tests/unit/test_anthropic_tool_schema.py` (34 tests, all passing);
+`tests/unit/test_run_orchestrator.py` + `tests/unit/test_intervention_lifecycle.py`
+(29 tests, all passing) run directly against the repo. Full deterministic
+suite `-m "not integration and not live_llm"`: 194 passed, 18 deselected --
++7 over the 187-test baseline before this change (net +5 in
+test_discovery_engine.py: -1 superseded, +6 new; +2 in the new schema
+test file), zero regressions. Full integration suite (17 tests, unchanged
+from baseline -- this fix is unit-level parsing/loop behavior, not
+surface/browser behavior, so no new integration test was added) run for
+real against a live headless browser via the cloud-sandbox tar/stage/
+extract/venv round-trip (checksummed byte-for-byte identical to the
+device's committed source): all pass. No Anthropic call was made for any
+of this verification. Diff reviewed end to end: exactly the 5 intended
+source/test files changed (`discovery/anthropic_client.py`,
+`discovery/engine.py`, `tests/fixtures/fake_llm_client.py`,
+`tests/unit/test_discovery_engine.py`, `tests/unit/test_run_orchestrator.py`)
+plus one new test file (`tests/unit/test_anthropic_tool_schema.py`);
+confirmed `pending_malformed_feedback` is always assigned from the
+already-redacted `trace_step.parse_error`, never the raw `parse_error`,
+so no new raw-sensitive-value exposure path was introduced. The real run
+(`e199e82bd3774cf6af2124d699ca5cfa`) and its intervention
+(`0f0b938ecdf04e1181a0564c3fa44e4e`, still `pending`) were not touched.

@@ -77,6 +77,27 @@ def malformed(raw_text: str = "<not structured output>", error: str | None = Non
     return LLMResponse(raw_text=raw_text, proposal=None, parse_error=error or "model response contained no tool_use block")
 
 
+def propose_missing_intent(
+    action_type: str,
+    *,
+    target: dict[str, Any] | None = None,
+    value: str | None = None,
+    reasoning: str = "test reasoning",
+) -> LLMResponse:
+    """A structurally-present tool-use payload that omits `intent` -- the
+    exact real shape from run e199e82bd3774cf6af2124d699ca5cfa
+    (DECISIONS_LOG.md): valid JSON, a real tool_use block, just missing a
+    field DiscoveryEngine._parse_proposal requires. Distinct from
+    `malformed()` above, which models the *other* malformed case (no
+    structured proposal at all, e.g. no tool_use block)."""
+    proposal: dict[str, Any] = {"reasoning": reasoning, "action_type": action_type}
+    if target is not None:
+        proposal["target"] = target
+    if value is not None:
+        proposal["value"] = value
+    return LLMResponse(raw_text=repr(proposal), proposal=proposal)
+
+
 def role_target(role: str, name: str | None = None) -> dict[str, Any]:
     target: dict[str, Any] = {"strategy": "role_name", "role": role}
     if name is not None:

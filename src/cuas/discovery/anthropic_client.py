@@ -70,7 +70,8 @@ _TOOL_SCHEMA: dict[str, Any] = {
             "intent": {
                 "type": "string",
                 "description": "Normalized business intent for this action, e.g. 'enter_member_id', "
-                "'submit_member_search', 'dismiss_known_popup'. Never the raw UI label text.",
+                "'submit_member_search', 'dismiss_known_popup'. Never the raw UI label text. "
+                "Required for every action proposal, i.e. whenever done is not true.",
             },
             "target": {
                 "type": "object",
@@ -89,6 +90,21 @@ _TOOL_SCHEMA: dict[str, Any] = {
             },
         },
         "required": ["reasoning"],
+        # `intent` cannot simply move into the flat `required` list above --
+        # a done=true response legitimately omits it (see `done`'s own
+        # description above). This says "reasoning is always required, and
+        # additionally: either this is a done claim, or intent is present" --
+        # the smallest way to make intent required for exactly the case
+        # DiscoveryEngine._parse_proposal already treats as required, without
+        # rejecting a valid done=true response. Anthropic tool-use does not
+        # hard-enforce this schema server-side the way strict/structured
+        # outputs do, so this is instruction to the model, not a substitute
+        # for _parse_proposal's own runtime validation -- that stays as
+        # defense in depth regardless of what this schema declares.
+        "anyOf": [
+            {"required": ["done"]},
+            {"required": ["intent"]},
+        ],
     },
 }
 
