@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from cuas.artifact import Artifact
-from cuas.discovery import DiscoveryGoal
+from cuas.discovery import DiscoveryGoal, DiscoveryPendingApproval
 from cuas.domain import AppContext, ControlState
 from cuas.handoff.errors import SessionNotFoundError
 from cuas.surface.adapter import SurfaceAdapter
@@ -94,8 +94,15 @@ class AutomationSession:
     # origin == "discovery": no artifact exists yet -- resuming means
     # giving the LLM another attempt at the same goal, on the same
     # surface (see orchestrator.py's `resume_run` docstring for why this
-    # is a deliberately simpler resume model than replay's).
+    # is a deliberately simpler resume model than replay's) -- UNLESS
+    # `pending_discovery_action` is set, in which case resuming means
+    # executing that exact operator-approved action first (see
+    # DiscoveryPendingApproval's docstring and DiscoveryEngine.run's
+    # `resume` parameter). Deliberately only ever held here, in-process --
+    # never serialized into InterventionRequest/evidence, exactly like
+    # every other field on this dataclass (see module docstring).
     discovery_goal: DiscoveryGoal | None = None
+    pending_discovery_action: DiscoveryPendingApproval | None = None
 
 
 class SessionRegistry:

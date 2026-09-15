@@ -4,6 +4,7 @@ from cuas.discovery.models import (
     DiscoveryGoal,
     DiscoveryHistoryEntry,
     DiscoveryLimits,
+    DiscoveryPendingApproval,
     DiscoveryResult,
     DiscoveryStatus,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "DiscoveryGoal",
     "DiscoveryHistoryEntry",
     "DiscoveryLimits",
+    "DiscoveryPendingApproval",
     "DiscoveryResult",
     "DiscoveryStatus",
     "DiscoveryTrace",

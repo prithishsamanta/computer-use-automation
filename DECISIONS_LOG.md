@@ -1713,3 +1713,199 @@ test, which needs a real API key and is out of scope here). No Anthropic
 call was made for any of this verification -- `FakeLLMClient` only, per
 instruction. The real run that exposed this
 (`d17d9a2fd9a8483c9ca278976f1cf520`) was not rerun.
+
+
+### Bugfix (post-live-LLM-run investigation) — discovery approval/resume did not authorize or execute the escalated action
+
+**Symptom (real Anthropic call, run `a4dac702e5cd4244ac2c22680834178a`,
+capability `discover_savings_balance_demo`):** step 0 was a rejected
+premature "done" (the materializable-progress gate above working exactly
+as intended); step 1 proposed `{"action_type": "read", "intent":
+"read_savings_account_balance", "target": {"strategy": "css", "selector":
+"tr:has(td:first-child:contains('Savings')) td:nth-child(3)"}}`.
+`read_savings_account_balance` appears in none of `LayeredPolicyEngine`'s
+layers, and `_parse_proposal` deliberately never sets `Action.risk` (see
+Phase 8's own docstring: this is what makes `model_fields_set`-based
+fail-closed behavior govern every LLM proposal), so `evaluate()` had zero
+opinions and correctly returned `REQUIRE_APPROVAL` -- confirmed, by
+reading `policy.py` end to end, to be intentional fail-closed behavior,
+not a bug: an unclassified intent must escalate, never silently execute.
+`RunOrchestrator` created intervention `ea0efacbd2f2445fb3b01b7345fdd63d`
+and kept the surface open in `AutomationSession`, exactly as designed.
+Separately, verified empirically (an isolated Playwright script, no repo
+files touched) that the proposed selector's `:contains()` pseudo-class is
+genuine jQuery/Sizzle syntax, never valid CSS or Playwright -- Playwright
+supports `:has()` (used correctly here) but throws a `SyntaxError` on
+`:contains()`. This real run (its log, trace, and intervention record)
+is preserved exactly as captured and was not modified for this fix, and
+the intervention itself was never approved/resumed/claimed as part of
+this work -- it remains `pending`.
+
+**Root cause (the actual gap, found on inspection rather than by
+reproducing a crash):** approving this intervention would not have done
+what "approve → resume" implies. `_run_discovery`'s resume path called
+`DiscoveryEngine.run(goal, context, limits, run_id=run_id)` again with no
+resume-related parameter at all -- `DiscoveryEngine.run()` had no notion
+of "the specific action that was escalated," so resuming meant a brand
+new LLM reasoning attempt from an empty `history`/`step_index=0`, on the
+same still-open surface. Concretely: (1) the exact policy-evaluated
+`Action` that triggered `REQUIRE_APPROVAL` was discarded, never
+authorized or executed -- an operator's approval had no mechanical effect
+beyond unblocking a fresh guess; (2) a fresh `DiscoveryTrace()` was always
+constructed at the top of `run()`, and `FileDiscoveryTraceStore.save()`
+unconditionally overwrites `<run_id>.json`, so resuming *any* paused
+discovery run (not just an approval) silently destroyed everything
+recorded before the pause -- a second, independent bug found by reading
+`trace.py`/`engine.py` together, not exercised by the real run above
+(which was never resumed). Compared directly against `ReplayEngine.run
+(resume_from_step_id=...)`, the already-correct analogous mechanism:
+replay re-slices `artifact.steps` to the resume point and skips policy
+for exactly that one step ("policy decisions here are pure functions of
+(step, context), so re-evaluating could only repeat a decision already
+made" -- replay's own comment); discovery had no equivalent at all.
+Also confirmed by reading `claim_intervention`/`mark_human_control_complete`:
+claiming an intervention only transfers control to an operator
+(`PENDING → CLAIMED`, session → `HUMAN_CONTROL`) and is explicitly
+non-authorizing; `mark_human_control_complete` (`CLAIMED → RESOLVED`,
+session → `RESUME_REQUESTED`) is the actual approval step -- this
+distinction was already correctly enforced by the existing state machine
+and needed no change, only a real resume mechanism to make "approve"
+mean something for discovery.
+
+**The design chosen — `DiscoveryPendingApproval`:** a new typed bundle
+(`discovery/models.py`) carrying exactly the in-process continuation
+state needed to resume faithfully: `pending_action` (the exact,
+already-parsed-and-evaluated `Action`), `step_index`, `history` (raw,
+unredacted, exactly as the loop held it), and the loop's own
+`total_tokens`/`needs_progress_reminder`/`last_signature`/
+`consecutive_repeats`. `DiscoveryResult.pending_approval` is set only
+when `status == DiscoveryStatus.APPROVAL_REQUIRED` -- never for `BLOCKED`
+(a policy DENY is terminal, exactly like replay's own "a policy DENY is
+not something an operator can approve past"; no continuation bundle is
+ever constructed for it) and never for any other terminal status. It is
+carried on `AutomationSession.pending_discovery_action` (a new field,
+`handoff/session.py`) precisely like every other field on that
+deliberately-plain, in-process-only dataclass -- never serialized into
+`InterventionRequest.evidence`, `reason`, or anywhere else that crosses a
+process/persistence boundary (confirmed: `RunResult`, the only shape the
+API layer ever returns, has no `pending_approval`/`history`/`action`
+field at all, so this cannot leak through that seam even by accident).
+
+`DiscoveryEngine.run()` gained one new parameter, `resume:
+DiscoveryPendingApproval | None`. When set: the existing trace is loaded
+via `trace_store.load(run_id)` (falling back to a fresh one only if none
+is found, e.g. `NullDiscoveryTraceStore`) instead of always constructing
+a new `DiscoveryTrace` -- fixing the overwrite bug above, but
+*deliberately scoped to only this branch*: every other discovery pause/
+resume path (`MALFORMED_MODEL_OUTPUT`, `LOOP_DETECTED`,
+`MAX_STEPS_EXCEEDED`, etc., resumed with no pending action) still
+constructs a fresh trace exactly as before, per the explicit instruction
+to limit this continuation behavior to `APPROVAL_REQUIRED` alone. The
+loop's counters/history are restored from `resume` instead of reset to
+empty/zero. Before the step loop begins, the exact `resume.pending_action`
+is executed once, directly -- no call to `propose_action` (nothing new
+was proposed), and no call to `self._policy.evaluate()` (that decision
+was already made and is now authorized; re-evaluating a pure function of
+`(action, context)` could only repeat it, mirroring `ReplayEngine`'s own
+`skip_policy_for_step_id` reasoning exactly). This is the ONLY action
+that ever bypasses a live policy check -- every subsequent proposal,
+starting the very next loop iteration, goes through `self._policy.
+evaluate()` completely normally and can escalate again on its own merits
+(verified by a test where the very next proposal is also
+`REQUIRE_APPROVAL` and does escalate again, rather than being silently
+allowed through). The bypass execution and every normal turn's execution
+now share one extracted method, `_execute_and_record` -- by construction,
+there is no way for the resumed path's error handling to diverge from a
+normal turn's: a `TargetNotFoundError`/`ValueError` becomes the same
+"execution_failed" `DiscoveryTraceStep`/`DiscoveryHistoryEntry` either
+way, and the bounded loop simply continues, exactly as it already does
+for any other execution failure. "Approval" therefore means "this
+specific action is authorized to run," never "this action will succeed."
+`_finish()` gained a `pending_approval` passthrough parameter so the
+escalation branch (the only call site that ever passes a non-`None`
+value) can attach the freshly-built bundle to the returned
+`DiscoveryResult`.
+
+`RunOrchestrator._run_discovery` gained a `discovery_resume` parameter,
+forwarded to `engine.run(resume=...)`; the `AutomationSession` created
+(or updated, on a second escalation reusing the same session) now also
+carries `pending_discovery_action = discovery_result.pending_approval`;
+`resume_run`'s discovery dispatch passes `discovery_resume=session.
+pending_discovery_action`. No change was needed to `claim_intervention`/
+`mark_human_control_complete`/the `InterventionStatus`/`ControlState`
+state machines themselves -- claim vs. approve semantics were already
+correct; the gap was entirely in what a subsequent `resume_run` for
+discovery actually *did*.
+
+**Deliberately not done (explicit scope, per instruction):** no
+`read_savings_account_balance` policy allowlist entry was added --
+proposals carrying this intent still fail closed to `REQUIRE_APPROVAL`
+every time, including a corrected retry with a fixed selector (see the
+new integration test below, which needs two separate approve-and-resume
+cycles for exactly this reason). No repair/sanitization of the invalid
+`:contains()` selector anywhere -- the exact approved selector is
+executed as-is and fails exactly as it did in the real run; the model
+recovers with a different, valid selector on its next turn, through the
+same generic "execution failure feeds back as history" path that already
+existed and needed no changes (`_execute_and_record` is a pure extraction
+of that existing code, not new failure-handling logic). No Anthropic call
+was made anywhere in this work. No modification to
+`a4dac702e5cd4244ac2c22680834178a`'s log/trace/intervention, or to the
+earlier-preserved `d17d9a2fd9a8483c9ca278976f1cf520` evidence set. The
+trace-overwrite bug is fixed only on the new `resume is not None` branch;
+every other discovery-resume path still constructs a fresh trace on
+resume exactly as before (a real, separate latent bug, left untouched
+because a correctness dependency did not require fixing it here and the
+instruction explicitly scoped this fix to `APPROVAL_REQUIRED`).
+
+**Tests added:** `tests/unit/test_discovery_engine.py` --
+`test_approval_escalation_captures_the_exact_pending_action`,
+`test_denied_action_never_produces_a_pending_approval_bundle`,
+`test_pending_approval_preserves_raw_history_while_result_history_stays_redacted`,
+`test_resume_executes_the_exact_approved_action_without_a_new_llm_call`,
+`test_only_the_resumed_action_bypasses_policy_subsequent_proposals_are_checked_normally`,
+`test_approved_action_that_fails_becomes_execution_failed_and_the_model_can_recover`,
+`test_max_steps_budget_survives_the_pause_rather_than_resetting`,
+`test_token_budget_survives_the_pause_rather_than_resetting`,
+`test_repetition_tracking_survives_the_pause_rather_than_resetting`,
+`test_resuming_appends_to_the_existing_trace_instead_of_overwriting_it`.
+`tests/unit/test_intervention_lifecycle.py` (new
+`TestDiscoveryApprovedActionResume` class) --
+`test_claiming_alone_does_not_authorize_resume`,
+`test_resume_before_human_control_complete_is_rejected`,
+`test_complete_then_resume_executes_the_exact_approved_action_without_a_new_llm_proposal`
+(this last one structurally proves no second surface is ever acquired --
+`sequential_surface_factory` is scripted with exactly one). A new
+end-to-end integration test,
+`tests/integration/test_discovery_engine_e2e.py::
+test_resuming_an_approved_action_recovers_from_an_invalid_selector`,
+reproduces the real scenario against the real demo app with `FakeLLMClient`
+only: dismiss the popup, search M1001, propose the exact invalid
+`:contains()` selector → `APPROVAL_REQUIRED` → resume executes it for
+real and it fails with a real Playwright `TargetNotFoundError` → the
+model's corrected-selector retry (same unclassified intent) escalates
+*again* → a second resume executes the corrected selector for real,
+reading the real page's actual savings balance (`$18204.55`) → a
+materializable-progress-satisfying `done` succeeds -- while also
+asserting the persisted trace file's pre-pause steps survive unchanged
+and further steps are appended after them.
+
+**Verified:** `tests/unit/test_discovery_engine.py` (27 tests, all
+passing) and `tests/unit/test_intervention_lifecycle.py` (16 tests, all
+passing) run directly against the repo. Full deterministic suite `-m
+"not integration and not live_llm"`: 187 passed, 18 deselected, zero
+regressions against the 174-test baseline before this change. Full
+integration suite (17 tests, including the one new test above) run for
+real against a live headless browser via the cloud-sandbox tar/stage/
+extract/venv round-trip (§5), byte-for-byte the same source files
+verified there as committed here (checksummed): all pass. No Anthropic
+call was made for any of this verification. Diff reviewed end to end:
+exactly the 8 intended files changed (`discovery/models.py`,
+`discovery/engine.py`, `discovery/__init__.py`, `handoff/session.py`,
+`orchestration/orchestrator.py`, plus the three test files); confirmed
+`pending_approval`/`pending_discovery_action`/raw `history` never reach
+`InterventionRequest`, `EvidenceStore`, any `RunEvent.details`, or
+`RunResult` -- only the in-process `AutomationSession`, exactly like
+every other live-session field. The real run
+(`a4dac702e5cd4244ac2c22680834178a`) and its intervention
+(`ea0efacbd2f2445fb3b01b7345fdd63d`, still `pending`) were not touched.

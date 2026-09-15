@@ -38,7 +38,7 @@ from cuas.handoff import (
 from cuas.orchestration import RunOrchestrator, RunOutcome
 from cuas.safety import LayeredPolicyEngine
 from cuas.surface.adapter import SurfaceAdapter
-from tests.fixtures.fake_llm_client import FakeLLMClient, propose, role_target
+from tests.fixtures.fake_llm_client import FakeLLMClient, propose, propose_done, role_target
 from tests.fixtures.fake_surface import FakeSurfaceAdapter
 from tests.fixtures.sample_artifacts import approval_required_capability
 
@@ -359,3 +359,103 @@ class TestDiscoveryEscalationSession:
         assert session.surface is surface
         assert session.origin == "discovery"
         assert interventions.get(result.intervention_id).session_id == result.session_id
+
+
+class TestDiscoveryApprovedActionResume:
+    """Approving a discovery-origin APPROVAL_REQUIRED intervention must
+    authorize and execute the EXACT action DiscoveryEngine escalated on --
+    not merely unblock a fresh LLM reasoning attempt on the same surface
+    (see engine.py's DiscoveryPendingApproval and this module's own
+    docstring). These exercise the same claim/complete/resume API
+    TestClaim/TestHumanControlComplete/TestResume already cover for
+    replay, now for a discovery-origin session carrying a pending action.
+    """
+
+    def _goal(self) -> DiscoveryGoal:
+        return DiscoveryGoal(
+            capability_id="close_account_capability",
+            description="Close the member's account.",
+            start_url=DEMO_URL,
+        )
+
+    async def test_claiming_alone_does_not_authorize_resume(
+        self, capability_service: CapabilityService, artifact_repo: ArtifactRepository, trace_store: DiscoveryTraceStore
+    ) -> None:
+        surface = FakeSurfaceAdapter()
+        llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close")))
+        orchestrator, _interventions, sessions = _make_orchestrator(
+            capability_service, artifact_repo, trace_store, sequential_surface_factory(surface), llm=llm
+        )
+
+        result = await orchestrator.run_capability("close_account_capability", {}, _context(), discovery_goal=self._goal())
+        assert result.outcome == RunOutcome.APPROVAL_REQUIRED
+        session = sessions.get(result.session_id)
+        assert session.pending_discovery_action is not None
+        assert session.pending_discovery_action.pending_action.intent == "close_account"
+
+        orchestrator.claim_intervention(result.intervention_id, operator_id="teller-1")
+
+        # Merely claiming is explicitly non-authorizing (.CLAUDE/04:
+        # claim just transfers control to the operator) -- resume_run
+        # must still refuse, exactly as it would for replay.
+        with pytest.raises(InterventionStateError):
+            await orchestrator.resume_run(result.intervention_id)
+
+    async def test_resume_before_human_control_complete_is_rejected(
+        self, capability_service: CapabilityService, artifact_repo: ArtifactRepository, trace_store: DiscoveryTraceStore
+    ) -> None:
+        surface = FakeSurfaceAdapter()
+        llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close")))
+        orchestrator, _interventions, _sessions = _make_orchestrator(
+            capability_service, artifact_repo, trace_store, sequential_surface_factory(surface), llm=llm
+        )
+
+        result = await orchestrator.run_capability("close_account_capability", {}, _context(), discovery_goal=self._goal())
+        assert result.outcome == RunOutcome.APPROVAL_REQUIRED
+
+        with pytest.raises(InterventionStateError):
+            await orchestrator.resume_run(result.intervention_id)
+
+    async def test_complete_then_resume_executes_the_exact_approved_action_without_a_new_llm_proposal(
+        self, capability_service: CapabilityService, artifact_repo: ArtifactRepository, trace_store: DiscoveryTraceStore
+    ) -> None:
+        """Only ONE surface is ever scripted -- resuming a discovery-
+        origin session never calls surface_factory again (same structural
+        guarantee TestResume relies on for replay). The second proposal
+        (submit_transaction) is ALSO require_approval, so this also shows
+        the exact approved action executing for real (the click reaches
+        the surface) while the very next turn still goes through normal
+        policy evaluation and escalates again, rather than reaching a
+        full artifact-materializing SUCCESS -- which needs a second,
+        unrelated verification-replay surface this test isn't about."""
+
+        surface = FakeSurfaceAdapter()
+        llm = FakeLLMClient(
+            propose("click", "close_account", target=role_target("button", "Close")),
+            propose("click", "submit_transaction", target=role_target("button", "Confirm")),
+        )
+        orchestrator, interventions, sessions = _make_orchestrator(
+            capability_service, artifact_repo, trace_store, sequential_surface_factory(surface), llm=llm
+        )
+
+        first = await orchestrator.run_capability("close_account_capability", {}, _context(), discovery_goal=self._goal())
+        assert first.outcome == RunOutcome.APPROVAL_REQUIRED
+        assert len(llm.calls) == 1  # only the original escalating proposal so far
+
+        orchestrator.claim_intervention(first.intervention_id, operator_id="teller-1")
+        orchestrator.mark_human_control_complete(first.intervention_id, operator_id="teller-1")
+        resumed = await orchestrator.resume_run(first.intervention_id)
+
+        assert resumed.run_id == first.run_id
+        # The close_account click genuinely executed against the surface
+        # (approved, not merely re-proposed)...
+        assert any(call[0] == "click" for call in surface.calls)
+        # ...and exactly one more LLM call happened after resume (the new
+        # submit_transaction proposal) -- never a second call re-proposing
+        # close_account itself -- and that new proposal was checked by
+        # policy normally, escalating again on its own merits.
+        assert len(llm.calls) == 2
+        assert resumed.outcome == RunOutcome.APPROVAL_REQUIRED
+        assert resumed.session_id == first.session_id
+        assert interventions.get(first.intervention_id).status == InterventionStatus.RESOLVED
+        assert interventions.get(resumed.intervention_id).reason is not None and "submit_transaction" in interventions.get(resumed.intervention_id).reason

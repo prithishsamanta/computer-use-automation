@@ -75,6 +75,7 @@ from cuas.discovery import (
     DiscoveryEngine,
     DiscoveryGoal,
     DiscoveryLimits,
+    DiscoveryPendingApproval,
     DiscoveryStatus,
     DiscoveryTraceStore,
     LLMClient,
@@ -370,22 +371,32 @@ class RunOrchestrator:
         *,
         run_id: str,
         resume_session_id: str | None = None,
+        discovery_resume: DiscoveryPendingApproval | None = None,
     ) -> RunResult:
         """Runs (or resumes) one discovery attempt, mirroring
         `_run_replay`'s surface-acquisition/pause/resume shape.
 
-        Resuming a paused *discovery* is a deliberately simpler model than
-        resuming a paused *replay*: `DiscoveryEngine` has no notion of
-        resuming an LLM conversation from a specific mid-loop point (that
-        would mean serializing and replaying model context, a much larger
-        feature this phase does not attempt). Instead, `resume_run` gives
-        the LLM a fresh `DiscoveryEngine.run()` call -- a new reasoning
-        attempt from scratch -- but on the exact same, still-open surface,
-        so whatever the operator did while in HUMAN_CONTROL (dismissed a
+        Resuming a paused discovery that has no pending approval
+        (`discovery_resume is None` -- every DiscoveryStatus other than
+        APPROVAL_REQUIRED) is a deliberately simpler model than resuming a
+        paused *replay*: `DiscoveryEngine` has no notion of resuming an
+        LLM conversation from a specific mid-loop point (that would mean
+        serializing and replaying model context, a much larger feature
+        this phase does not attempt). Instead, `resume_run` gives the LLM
+        a fresh `DiscoveryEngine.run()` call -- a new reasoning attempt
+        from scratch -- but on the exact same, still-open surface, so
+        whatever the operator did while in HUMAN_CONTROL (dismissed a
         blocking dialog, navigated past a broken page, manually satisfied
         a captcha) is reflected in what the model observes next. This is
         an explicit simplification, not an oversight -- see
         DECISIONS_LOG.md's Phase 12 entry.
+
+        When the pause WAS an APPROVAL_REQUIRED escalation, `resume_run`
+        instead passes `session.pending_discovery_action` here as
+        `discovery_resume`, and `DiscoveryEngine.run(resume=...)` executes
+        that exact operator-approved action directly rather than asking
+        the model to re-propose it -- see DiscoveryPendingApproval's
+        docstring and DECISIONS_LOG.md's later entry closing this gap.
         """
 
         assert self._llm is not None  # caller (run_capability/resume_run) already checked
@@ -410,7 +421,9 @@ class RunOrchestrator:
             trace_store=self._trace_store,
         )
         try:
-            discovery_result = await engine.run(goal, context, self._discovery_limits, run_id=run_id)
+            discovery_result = await engine.run(
+                goal, context, self._discovery_limits, run_id=run_id, resume=discovery_resume
+            )
         except Exception:
             await self._close_surface(cm, resume_session_id)
             raise
@@ -456,10 +469,12 @@ class RunOrchestrator:
                     surface_cm=cm,
                     control_state=ControlState.PAUSED_WAITING_FOR_HUMAN,
                     discovery_goal=goal,
+                    pending_discovery_action=discovery_result.pending_approval,
                 )
             )
         else:
             session.control_state = ControlState.PAUSED_WAITING_FOR_HUMAN
+            session.pending_discovery_action = discovery_result.pending_approval
 
         if discovery_result.status == DiscoveryStatus.APPROVAL_REQUIRED:
             intervention_id = self._create_intervention(
@@ -794,6 +809,7 @@ class RunOrchestrator:
                 session.context,
                 run_id=session.run_id,
                 resume_session_id=session.session_id,
+                discovery_resume=session.pending_discovery_action,
             )
 
         return self._finish(result)

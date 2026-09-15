@@ -464,3 +464,287 @@ async def test_successful_run_emits_run_completed_exactly_once() -> None:
 
     assert result.status == DiscoveryStatus.SUCCESS
     assert len(sink.events_of(EventType.RUN_COMPLETED)) == 1
+# ---------------------------------------------------------------------------
+# Discovery pause/resume continuation (DiscoveryPendingApproval): approving
+# an APPROVAL_REQUIRED intervention must authorize and execute the EXACT
+# action that escalated, not discard it for a fresh LLM reasoning attempt.
+# See DECISIONS_LOG.md for the full design rationale; test_intervention_
+# lifecycle.py covers the same behavior through the real claim/complete/
+# resume orchestrator API, these exercise DiscoveryEngine.run(resume=...)
+# directly.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approval_escalation_captures_the_exact_pending_action() -> None:
+    """The DiscoveryPendingApproval bundle attached to an APPROVAL_REQUIRED
+    result carries the exact Action policy evaluated, plus the loop's own
+    continuation state at the moment of escalation -- not a re-derived or
+    re-serialized copy."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close Account")))
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.APPROVAL_REQUIRED
+    assert result.pending_approval is not None
+    pending = result.pending_approval
+    assert pending.pending_action.intent == "close_account"
+    assert pending.pending_action.action_type == ActionType.CLICK
+    assert pending.step_index == 0
+    assert pending.history[-1].outcome == "approval_required"
+    assert pending.history[-1].action.intent == "close_account"
+    assert pending.consecutive_repeats == 0
+    assert pending.needs_progress_reminder is False
+
+
+@pytest.mark.asyncio
+async def test_denied_action_never_produces_a_pending_approval_bundle() -> None:
+    """Only APPROVAL_REQUIRED is something an operator can authorize past
+    -- a DENY is terminal (mirrors ReplayEngine's own "a policy DENY is
+    not something an operator can approve past"), so no continuation
+    bundle is ever created for it."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose("click", "navigate_unauthorized_domain", target=role_target("link", "External Site")))
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.BLOCKED
+    assert result.pending_approval is None
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_preserves_raw_history_while_result_history_stays_redacted() -> None:
+    """`DiscoveryResult.history` is the safe, redacted copy every existing
+    caller already gets; `pending_approval.history` is deliberately the
+    RAW in-memory history (only ever consumed in-process by a resumed
+    DiscoveryEngine.run() call, never persisted to InterventionRequest/
+    evidence -- see DiscoveryPendingApproval's docstring)."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(
+        propose("fill", "search_member", target=role_target("textbox"), value="M1001"),
+        propose("click", "close_account", target=role_target("button", "Close Account")),
+    )
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.APPROVAL_REQUIRED
+    assert result.history[0].action.value == "{{member_id}}"
+    assert "M1001" not in repr(result.history)
+    assert result.pending_approval.history[0].action.value == "M1001"
+
+
+@pytest.mark.asyncio
+async def test_resume_executes_the_exact_approved_action_without_a_new_llm_call() -> None:
+    """No new LLM call happens for the resumed turn at all -- the action
+    was already fully proposed, parsed, and policy-evaluated before the
+    pause; resuming only authorizes and executes it."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close Account")))
+    first = await _engine(fake, llm).run(_goal(), CONTEXT)
+    assert first.status == DiscoveryStatus.APPROVAL_REQUIRED
+    pending = first.pending_approval
+
+    # No further responses scripted at all -- if resuming asked the model
+    # to re-propose the already-approved action, FakeLLMClient's "ran out
+    # of scripted responses" AssertionError would fail this test.
+    llm2 = FakeLLMClient()
+    second = await _engine(fake, llm2).run(
+        _goal(), CONTEXT, DiscoveryLimits(max_steps=1), run_id=first.run_id, resume=pending
+    )
+
+    assert llm2.calls == []
+    assert any(call[0] == "click" for call in fake.calls)
+    assert second.status == DiscoveryStatus.MAX_STEPS_EXCEEDED  # budget already spent, see below
+
+
+@pytest.mark.asyncio
+async def test_only_the_resumed_action_bypasses_policy_subsequent_proposals_are_checked_normally() -> None:
+    """The policy bypass applies to exactly one action -- the one an
+    operator just approved. A brand-new proposal made after resuming (even
+    one that also requires approval) goes through LayeredPolicyEngine.
+    evaluate() exactly like any normal turn, and can escalate again on its
+    own merits."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close Account")))
+    first = await _engine(fake, llm).run(_goal(), CONTEXT)
+    pending = first.pending_approval
+
+    llm2 = FakeLLMClient(propose("click", "submit_transaction", target=role_target("button", "Submit")))
+    second = await _engine(fake, llm2).run(_goal(), CONTEXT, run_id=first.run_id, resume=pending)
+
+    assert len(llm2.calls) == 1
+    assert second.status == DiscoveryStatus.APPROVAL_REQUIRED
+    assert second.pending_approval is not None
+    assert second.pending_approval.pending_action.intent == "submit_transaction"
+
+
+@pytest.mark.asyncio
+async def test_approved_action_that_fails_becomes_execution_failed_and_the_model_can_recover() -> None:
+    """Approval never implies execution success: if the exact approved
+    action still fails against the live surface, it becomes an ordinary
+    "execution_failed" history entry -- the same generic recoverable-
+    failure path any other turn uses -- and the bounded loop simply
+    continues, giving the model a chance to correct course (the same
+    reasoning that made resuming the real invalid-:contains()-selector
+    intervention safe without special-casing anything)."""
+
+    from cuas.domain import Locator, LocatorStrategy, Target
+
+    fake = FakeSurfaceAdapter()
+    close_target = role_target("button", "Close Account")
+    real_close_target = Target(
+        primary=Locator(strategy=LocatorStrategy.ROLE_NAME, params={"role": "button", "name": "Close Account"})
+    )
+    fake.script_click(real_close_target, TargetNotFoundError("no element matched role=button name='Close Account'"))
+
+    llm = FakeLLMClient(propose("click", "close_account", target=close_target))
+    first = await _engine(fake, llm).run(_goal(), CONTEXT)
+    assert first.status == DiscoveryStatus.APPROVAL_REQUIRED
+    pending = first.pending_approval
+
+    balance_target = role_target("text", "Savings Balance")
+    real_balance_target = Target(
+        primary=Locator(strategy=LocatorStrategy.ROLE_NAME, params={"role": "text", "name": "Savings Balance"})
+    )
+    fake.script_read(real_balance_target, "$0.00")
+    llm2 = FakeLLMClient(
+        propose("read", "view_account", target=balance_target),
+        propose_done("account no longer active; balance recorded as zero"),
+    )
+
+    second = await _engine(fake, llm2).run(_goal(), CONTEXT, run_id=first.run_id, resume=pending)
+
+    assert second.status == DiscoveryStatus.SUCCESS
+    assert second.history[0].outcome == "approval_required"
+    assert second.history[1].outcome == "execution_failed"
+    assert second.history[1].action.intent == "close_account"
+    assert "no element matched" in second.history[1].error_message
+    assert second.history[2].outcome == "executed"
+    assert second.history[2].action.action_type == ActionType.READ
+    assert second.history[2].read_value == "$0.00"
+    assert len(llm2.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_max_steps_budget_survives_the_pause_rather_than_resetting() -> None:
+    """The step count already spent proposing/escalating the approved
+    action counts against the same max_steps budget after resume -- it is
+    not restored to a fresh max_steps allotment."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close Account")))
+    limits = DiscoveryLimits(max_steps=2)
+    first = await _engine(fake, llm).run(_goal(), CONTEXT, limits)
+    assert first.status == DiscoveryStatus.APPROVAL_REQUIRED
+    pending = first.pending_approval
+
+    # Only one more turn's worth of budget remains (max_steps=2 total, one
+    # step already spent on the escalated proposal). If resuming silently
+    # reset the step counter, DiscoveryEngine would ask for a second
+    # response here, which FakeLLMClient treats as a hard test failure.
+    llm2 = FakeLLMClient(propose_done("nothing materialized"))
+    second = await _engine(fake, llm2).run(_goal(), CONTEXT, limits, run_id=first.run_id, resume=pending)
+
+    assert second.status == DiscoveryStatus.MAX_STEPS_EXCEEDED
+    assert len(llm2.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_token_budget_survives_the_pause_rather_than_resetting() -> None:
+    """total_tokens already spent before the pause counts against the
+    same max_total_tokens budget after resume."""
+
+    from cuas.discovery.llm_client import LLMResponse
+
+    fake = FakeSurfaceAdapter()
+    escalating = LLMResponse(
+        raw_text="escalating",
+        proposal={
+            "reasoning": "test", "action_type": "click", "intent": "close_account",
+            "target": role_target("button", "Close Account"),
+        },
+        input_tokens=900,
+        output_tokens=50,
+    )
+    llm = FakeLLMClient(escalating)
+    limits = DiscoveryLimits(max_total_tokens=1000)
+    first = await _engine(fake, llm).run(_goal(), CONTEXT, limits)
+    assert first.status == DiscoveryStatus.APPROVAL_REQUIRED
+    pending = first.pending_approval
+    assert pending.total_tokens == 950
+
+    # If the pause had silently reset total_tokens to 0, this next
+    # response's 60 tokens would fit comfortably under the 1000 budget
+    # instead of pushing the (correctly-preserved) running total over it.
+    next_response = LLMResponse(
+        raw_text="next",
+        proposal={
+            "reasoning": "test", "action_type": "read", "intent": "view_account",
+            "target": role_target("text", "Savings Balance"),
+        },
+        input_tokens=60,
+        output_tokens=0,
+    )
+    llm2 = FakeLLMClient(next_response)
+    second = await _engine(fake, llm2).run(_goal(), CONTEXT, limits, run_id=first.run_id, resume=pending)
+
+    assert second.status == DiscoveryStatus.MAX_TOKENS_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_repetition_tracking_survives_the_pause_rather_than_resetting() -> None:
+    """consecutive_repeats/last_signature already accumulated before the
+    pause continue accumulating after resume, rather than looking like a
+    first occurrence again."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close Account")))
+    first = await _engine(fake, llm).run(_goal(), CONTEXT)
+    assert first.pending_approval.consecutive_repeats == 0
+    assert first.pending_approval.last_signature is not None
+
+    # The very next proposal after resume repeats the identical action
+    # signature. Carried-forward repetition state recognizes this as a
+    # repeat (consecutive_repeats == 1); a silent reset would look like a
+    # first occurrence again (consecutive_repeats staying 0).
+    llm2 = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close Account")))
+    second = await _engine(fake, llm2).run(_goal(), CONTEXT, run_id=first.run_id, resume=first.pending_approval)
+
+    assert second.status == DiscoveryStatus.APPROVAL_REQUIRED
+    assert second.pending_approval.consecutive_repeats == 1
+
+
+@pytest.mark.asyncio
+async def test_resuming_appends_to_the_existing_trace_instead_of_overwriting_it(tmp_path) -> None:
+    """FileDiscoveryTraceStore.save() unconditionally overwrites
+    <run_id>.json -- resuming must load the pre-pause trace and append to
+    it, not construct a brand-new DiscoveryTrace that discards everything
+    already recorded before the escalation."""
+
+    fake = FakeSurfaceAdapter()
+    llm = FakeLLMClient(propose("click", "close_account", target=role_target("button", "Close Account")))
+    trace_store = FileDiscoveryTraceStore(tmp_path)
+    first = await _engine(fake, llm, trace_store=trace_store).run(_goal(), CONTEXT)
+    assert first.status == DiscoveryStatus.APPROVAL_REQUIRED
+
+    original_trace = trace_store.load(first.run_id)
+    assert len(original_trace.steps) == 1
+    assert original_trace.steps[0].outcome == "approval_required"
+
+    llm2 = FakeLLMClient(propose_done("nothing else to record"))
+    await _engine(fake, llm2, trace_store=trace_store).run(
+        _goal(), CONTEXT, DiscoveryLimits(max_steps=2), run_id=first.run_id, resume=first.pending_approval
+    )
+
+    final_trace = trace_store.load(first.run_id)
+    # The original pre-pause step is still there, not replaced...
+    assert final_trace.steps[0].outcome == "approval_required"
+    # ...and the resumed execution appended further steps on top of it.
+    assert len(final_trace.steps) > 1
+    assert any(step.outcome == "executed" for step in final_trace.steps)

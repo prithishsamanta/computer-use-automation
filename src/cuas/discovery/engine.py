@@ -71,6 +71,7 @@ from cuas.discovery.models import (
     DiscoveryGoal,
     DiscoveryHistoryEntry,
     DiscoveryLimits,
+    DiscoveryPendingApproval,
     DiscoveryResult,
     DiscoveryStatus,
 )
@@ -149,7 +150,18 @@ class DiscoveryEngine:
         limits: DiscoveryLimits | None = None,
         *,
         run_id: str | None = None,
+        resume: DiscoveryPendingApproval | None = None,
     ) -> DiscoveryResult:
+        """`resume`, when not None, continues a discovery attempt that
+        previously paused with DiscoveryStatus.APPROVAL_REQUIRED: the
+        exact `resume.pending_action` an operator has now authorized is
+        executed directly (no new LLM proposal, no re-evaluation through
+        policy -- see DiscoveryPendingApproval's docstring), the loop's
+        own budgets/counters are restored rather than reset, and the
+        existing discovery trace for this run_id is appended to instead
+        of being overwritten. `None` (the default) is byte-for-byte the
+        original behavior: a fresh attempt from goal.start_url."""
+
         run_id = run_id or uuid.uuid4().hex
         limits = limits or DiscoveryLimits()
         named_values = goal.named_sensitive_values()
@@ -161,40 +173,107 @@ class DiscoveryEngine:
                 "capability_id": goal.capability_id,
                 "tenant_id": context.tenant_id,
                 "inputs": redact_dict(goal.inputs, goal.sensitive_inputs),
+                "resumed": resume is not None,
             },
         )
 
-        trace = DiscoveryTrace(
-            run_id=run_id,
-            capability_id=goal.capability_id,
-            # Redacted even though it's caller-authored, not model output --
-            # a goal description commonly embeds the very input it's
-            # describing (e.g. "Find member M1001..."), and this field is
-            # persisted to disk like everything else in the trace.
-            goal_description=redact_named_values(goal.description, named_values),
-            started_at=datetime.now(timezone.utc),
-        )
+        if resume is not None:
+            # Continue the SAME trace file instead of silently overwriting
+            # it (FileDiscoveryTraceStore.save() unconditionally overwrites
+            # <run_id>.json, and a fresh DiscoveryTrace() here would
+            # destroy the pre-escalation steps). Falls back to a fresh
+            # trace if none can be loaded (e.g. NullDiscoveryTraceStore) --
+            # exactly as safe as the non-resume path, just with nothing to
+            # append to. Deliberately narrow: only ever reached when
+            # `resume` is not None, which only ever happens for an
+            # APPROVAL_REQUIRED-originated continuation -- every other
+            # discovery pause/resume path is unchanged.
+            try:
+                trace = self._trace_store.load(run_id)
+            except FileNotFoundError:
+                trace = DiscoveryTrace(
+                    run_id=run_id,
+                    capability_id=goal.capability_id,
+                    goal_description=redact_named_values(goal.description, named_values),
+                    started_at=datetime.now(timezone.utc),
+                )
+            history: list[DiscoveryHistoryEntry] = list(resume.history)
+            last_signature: str | None = resume.last_signature
+            consecutive_repeats = resume.consecutive_repeats
+            total_tokens = resume.total_tokens
+            needs_progress_reminder = resume.needs_progress_reminder
+        else:
+            trace = DiscoveryTrace(
+                run_id=run_id,
+                capability_id=goal.capability_id,
+                # Redacted even though it's caller-authored, not model output --
+                # a goal description commonly embeds the very input it's
+                # describing (e.g. "Find member M1001..."), and this field is
+                # persisted to disk like everything else in the trace.
+                goal_description=redact_named_values(goal.description, named_values),
+                started_at=datetime.now(timezone.utc),
+            )
+            history = []
+            last_signature = None
+            consecutive_repeats = 0
+            total_tokens = 0
+            # Set once a "done" claim is rejected for producing no
+            # materializable progress (see _has_materializable_progress) --
+            # from then on, every subsequent turn's observation carries a
+            # reminder until the model actually executes a READ. Never
+            # cleared back to False: once real progress exists, a later
+            # "done" simply succeeds regardless of this flag's value, so
+            # there is nothing to reset.
+            needs_progress_reminder = False
 
-        history: list[DiscoveryHistoryEntry] = []
-        last_signature: str | None = None
-        consecutive_repeats = 0
-        total_tokens = 0
         start_time = self._clock()
-        # Set once a "done" claim is rejected for producing no
-        # materializable progress (see _has_materializable_progress) --
-        # from then on, every subsequent turn's observation carries a
-        # reminder until the model actually executes a READ. Never
-        # cleared back to False: once real progress exists, a later
-        # "done" simply succeeds regardless of this flag's value, so
-        # there is nothing to reset.
-        needs_progress_reminder = False
-
-        await self._surface.navigate(goal.start_url)
-        observation = await self._surface.observe()
-
         result: DiscoveryResult | None = None
 
-        for step_index in range(limits.max_steps):
+        if resume is not None:
+            # Execute exactly the operator-approved action -- no LLM call
+            # (nothing new was proposed) and no re-evaluation through
+            # policy (that decision, REQUIRE_APPROVAL, was already made
+            # and is now authorized by the operator; policy is a pure
+            # function of (action, context), so re-checking could only
+            # repeat the same decision -- exactly ReplayEngine's own
+            # skip_policy_for_step_id reasoning). Shares
+            # `_execute_and_record` with the normal loop below so
+            # "approval does not imply execution success" holds by
+            # construction: an execution failure here becomes the same
+            # ordinary "execution_failed" history entry a normal turn
+            # would produce, and the bounded loop below simply continues.
+            action = resume.pending_action
+            execution_step_index = resume.step_index
+            observation = await self._surface.observe()
+            self._emit(
+                run_id, EventType.STEP_STARTED, step_id=str(execution_step_index),
+                details={"url": redact_named_values(observation.url, named_values), "resumed": True},
+            )
+            self._emit(
+                run_id, EventType.POLICY_CHECKED, step_id=str(execution_step_index),
+                details={"decision": "skipped_on_resume", "intent": action.intent},
+            )
+            trace_step = DiscoveryTraceStep(
+                step_index=execution_step_index,
+                observation_url=redact_named_values(observation.url, named_values),
+                observation_text_excerpt=redact_named_values(
+                    observation.visible_text[:_OBSERVATION_EXCERPT_CHARS], named_values
+                ),
+                raw_model_output=None,
+                policy_decision=PolicyDecision.REQUIRE_APPROVAL,
+                parsed_action=redact_named_values_json(action.model_dump(mode="json"), named_values),
+            )
+            observation = await self._execute_and_record(
+                run_id, execution_step_index, action, PolicyDecision.REQUIRE_APPROVAL,
+                trace_step, trace, history, named_values,
+            )
+            start_step = execution_step_index + 1
+        else:
+            await self._surface.navigate(goal.start_url)
+            observation = await self._surface.observe()
+            start_step = 0
+
+        for step_index in range(start_step, limits.max_steps):
             if self._clock() - start_time > limits.max_duration_seconds:
                 result = self._finish(
                     run_id, DiscoveryStatus.MAX_DURATION_EXCEEDED, goal, step_index, history,
@@ -340,9 +419,29 @@ class DiscoveryEngine:
                 history.append(DiscoveryHistoryEntry(step_index=step_index, action=action, policy_decision=decision, outcome=outcome))
                 status = DiscoveryStatus.BLOCKED if decision == PolicyDecision.DENY else DiscoveryStatus.APPROVAL_REQUIRED
                 verb = "denied" if decision == PolicyDecision.DENY else "requires operator approval for"
+                # Only APPROVAL_REQUIRED is something an operator can
+                # authorize past -- a DENY is terminal (see module
+                # docstring/DECISIONS_LOG.md), so no continuation bundle
+                # is ever created for it, mirroring replay's own "a
+                # policy DENY... is not something an operator can approve
+                # past" rule.
+                pending_approval = (
+                    DiscoveryPendingApproval(
+                        pending_action=action,
+                        step_index=step_index,
+                        history=list(history),
+                        total_tokens=total_tokens,
+                        needs_progress_reminder=needs_progress_reminder,
+                        last_signature=last_signature,
+                        consecutive_repeats=consecutive_repeats,
+                    )
+                    if status == DiscoveryStatus.APPROVAL_REQUIRED
+                    else None
+                )
                 result = self._finish(
                     run_id, status, goal, step_index, history,
                     reason=f"policy {verb} proposed action (intent={action.intent!r})",
+                    pending_approval=pending_approval,
                 )
                 break
 
@@ -355,43 +454,8 @@ class DiscoveryEngine:
                 },
             )
 
-            error_message: str | None = None
-            read_value: str | None = None
-            try:
-                read_value = await self._execute(action)
-                trace_step.outcome = "executed"
-            except (AutomationError, ValueError) as exc:
-                error_message = str(exc)
-                trace_step.outcome = "execution_failed"
-                trace_step.execution_error = redact_named_values(error_message, named_values)
-                await self._capture_step_failure_evidence(run_id, step_index, exc, history)
-
-            trace_step.read_value = redact_named_values(read_value, named_values) if read_value is not None else None
-
-            self._emit(
-                run_id,
-                EventType.ACTION_EXECUTED if error_message is None else EventType.STEP_FAILED,
-                step_id=str(step_index),
-                status="success" if error_message is None else "failure",
-                details={
-                    "action_type": action.action_type.value,
-                    "intent": action.intent,
-                    **({"error": trace_step.execution_error} if trace_step.execution_error else {}),
-                },
-            )
-
-            trace.steps.append(trace_step)
-            observation = await self._surface.observe()
-            history.append(
-                DiscoveryHistoryEntry(
-                    step_index=step_index,
-                    action=action,
-                    policy_decision=decision,
-                    outcome=trace_step.outcome,
-                    error_message=error_message,
-                    observation_after=observation,
-                    read_value=read_value,
-                )
+            observation = await self._execute_and_record(
+                run_id, step_index, action, decision, trace_step, trace, history, named_values
             )
         else:
             result = self._finish(
@@ -500,6 +564,68 @@ class DiscoveryEngine:
             return await self._surface.read(action.target)
         else:
             raise ValueError(f"unsupported action_type for discovery: {action.action_type}")
+
+    # -- shared execute-and-record turn --------------------------------------
+
+    async def _execute_and_record(
+        self,
+        run_id: str,
+        step_index: int,
+        action: Action,
+        decision: PolicyDecision,
+        trace_step: DiscoveryTraceStep,
+        trace: DiscoveryTrace,
+        history: list[DiscoveryHistoryEntry],
+        named_values: dict[str, str],
+    ) -> Observation:
+        """Executes one already policy-cleared action and records the
+        outcome identically whether it came from a normal turn's fresh
+        LLM proposal or from a resumed, operator-approved
+        DiscoveryPendingApproval.pending_action -- the single execution
+        path both share, so approval can never imply execution success by
+        construction (a failure here becomes the same ordinary
+        "execution_failed" trace_step/history entry either way, and the
+        caller's bounded loop is what decides what happens next)."""
+
+        error_message: str | None = None
+        read_value: str | None = None
+        try:
+            read_value = await self._execute(action)
+            trace_step.outcome = "executed"
+        except (AutomationError, ValueError) as exc:
+            error_message = str(exc)
+            trace_step.outcome = "execution_failed"
+            trace_step.execution_error = redact_named_values(error_message, named_values)
+            await self._capture_step_failure_evidence(run_id, step_index, exc, history)
+
+        trace_step.read_value = redact_named_values(read_value, named_values) if read_value is not None else None
+
+        self._emit(
+            run_id,
+            EventType.ACTION_EXECUTED if error_message is None else EventType.STEP_FAILED,
+            step_id=str(step_index),
+            status="success" if error_message is None else "failure",
+            details={
+                "action_type": action.action_type.value,
+                "intent": action.intent,
+                **({"error": trace_step.execution_error} if trace_step.execution_error else {}),
+            },
+        )
+
+        trace.steps.append(trace_step)
+        observation = await self._surface.observe()
+        history.append(
+            DiscoveryHistoryEntry(
+                step_index=step_index,
+                action=action,
+                policy_decision=decision,
+                outcome=trace_step.outcome,
+                error_message=error_message,
+                observation_after=observation,
+                read_value=read_value,
+            )
+        )
+        return observation
 
     # -- outcome detection ------------------------------------------------
 
@@ -639,6 +765,7 @@ class DiscoveryEngine:
     def _finish(
         self, run_id: str, status: DiscoveryStatus, goal: DiscoveryGoal, steps_taken: int,
         history: list[DiscoveryHistoryEntry], *, reason: str,
+        pending_approval: DiscoveryPendingApproval | None = None,
     ) -> DiscoveryResult:
         is_escalation = status in (DiscoveryStatus.BLOCKED, DiscoveryStatus.APPROVAL_REQUIRED)
         return DiscoveryResult(
@@ -647,6 +774,7 @@ class DiscoveryEngine:
             escalation_reason=reason if is_escalation else None,
             error_message=None if is_escalation else reason,
             history=self._redact_history(history, goal.named_sensitive_values()),
+            pending_approval=pending_approval,
         )
 
     def _redact_history(

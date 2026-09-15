@@ -129,6 +129,47 @@ class DiscoveryHistoryEntry(BaseModel):
     )
 
 
+class DiscoveryPendingApproval(BaseModel):
+    """The exact in-process continuation state needed to resume a discovery
+    run that paused for APPROVAL_REQUIRED, so that approving the
+    intervention authorizes and executes precisely the action the model
+    proposed -- not a fresh reasoning attempt that merely happens to start
+    from the same surface (see DECISIONS_LOG.md for the full rationale).
+
+    `pending_action` is the exact, already policy-evaluated Action that
+    triggered REQUIRE_APPROVAL. On resume, DiscoveryEngine executes this
+    action directly, without asking the model to re-propose it, and
+    without re-running it through LayeredPolicyEngine.evaluate() -- policy
+    is a pure function of (action, context), so re-evaluating the same
+    action could only repeat the decision already made (the same reasoning
+    ReplayEngine's own resume_from_step_id already relies on).
+
+    The remaining fields are the loop-local counters/history needed to
+    continue the SAME bounded discovery attempt rather than silently
+    resetting its budgets: `history` is the raw (unredacted)
+    in-memory history so far, `step_index` is the index of the step that
+    escalated, and `total_tokens`/`needs_progress_reminder`/
+    `last_signature`/`consecutive_repeats` are the loop's own budget/
+    repetition-detection state at the moment of escalation.
+
+    Deliberately NOT persisted to any cross-process file (intervention
+    records, evidence, or anywhere else): this lives only on the in-process
+    AutomationSession, exactly like AutomationSession itself. A process
+    restart loses it, exactly as a live session cannot outlive the process
+    today (see handoff/session.py's docstring) -- this does not make
+    anything less safe than the status quo, since a lost session already
+    fails resume_run with SessionNotFoundError rather than fabricating one.
+    """
+
+    pending_action: Action
+    step_index: int
+    history: list[DiscoveryHistoryEntry] = Field(default_factory=list)
+    total_tokens: int = 0
+    needs_progress_reminder: bool = False
+    last_signature: str | None = None
+    consecutive_repeats: int = 0
+
+
 class DiscoveryResult(BaseModel):
     run_id: str
     status: DiscoveryStatus
@@ -139,3 +180,11 @@ class DiscoveryResult(BaseModel):
     escalation_reason: str | None = None
     error_message: str | None = None
     history: list[DiscoveryHistoryEntry] = Field(default_factory=list)
+    pending_approval: DiscoveryPendingApproval | None = Field(
+        default=None,
+        description=(
+            "Set only when status == APPROVAL_REQUIRED. Carries the exact "
+            "pending action plus in-memory continuation state an operator's "
+            "approval should authorize -- see DiscoveryPendingApproval."
+        ),
+    )
