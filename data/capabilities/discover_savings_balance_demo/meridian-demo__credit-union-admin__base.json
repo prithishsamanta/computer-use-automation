@@ -1,0 +1,13 @@
+{
+  "capability_id": "discover_savings_balance_demo",
+  "name": "Discover Savings Balance Demo",
+  "description": "Read the member's savings account balance from the accounts table shown on this page (the row where the account type is Savings) and report its value.",
+  "vendor": "meridian-demo",
+  "application": "credit-union-admin",
+  "supported_versions": [
+    "1.0.0"
+  ],
+  "tenant_scope": "base",
+  "artifact_version": "1.0.0",
+  "status": "active"
+}

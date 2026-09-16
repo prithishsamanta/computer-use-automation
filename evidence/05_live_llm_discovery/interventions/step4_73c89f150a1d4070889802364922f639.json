@@ -1,0 +1,14 @@
+{
+  "id": "73c89f150a1d4070889802364922f639",
+  "run_id": "1ce8002332b94aeaa4397eff7e0fb1e0",
+  "capability_id": "discover_savings_balance_demo",
+  "tenant_id": "base",
+  "current_step": "4",
+  "reason": "policy requires operator approval for proposed action (intent='read_savings_balance_from_savings_row')",
+  "evidence": {},
+  "session_id": "9a6f732008eb4b2dbdd1a48496d95031",
+  "status": "resolved",
+  "claimed_by": "teller-1",
+  "created_at": "2026-09-16T02:31:23.976409Z",
+  "resolved_at": "2026-09-16T02:32:31.672848Z"
+}

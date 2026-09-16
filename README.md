@@ -10,8 +10,17 @@ The full design context this implementation follows lives in `.CLAUDE/`.
 
 ## Status
 
-Under active development. See `REPORT.md` (once written) for the
-architecture writeup.
+Feature-complete for this take-home. See `REPORT.md` for the
+architecture writeup (design, discovery -> artifact -> replay, safety,
+testing, and known limitations) and `evidence/` for curated, real
+runtime evidence for every scenario it describes -- including a genuine
+LLM-driven discovery run (`evidence/05_live_llm_discovery/`).
+
+**Shortest path to evaluate this submission:** `docker compose up
+--build`, then run the single deterministic-demo `curl` command in
+"Demo paths" below -- see that section for exactly what to expect, and
+`evidence/01_deterministic_replay/` for the same scenario's real,
+pre-captured output if you'd rather read than run.
 
 ## Local development (without Docker)
 
@@ -55,6 +64,94 @@ This is the canonical, single-command reproducible demo path:
 docker compose build
 docker compose up
 ```
+
+(`docker compose up --build` does both in one step.)
+
+### Demo paths
+
+Four independent things you can do against the running stack, from
+least to most involved. All four hit the same `POST /runs` endpoint
+(`RunRequest` in `src/cuas/api/schemas.py`); what differs is the body.
+
+**(a) Deterministic pre-registered demo -- no API key needed, this is
+the shortest reliable evaluator path.** A capability (`get_savings_balance`)
+and its artifact are already committed in this repo
+(`data/capabilities/`, `data/artifacts/`) -- no discovery run is needed
+first. Real, pre-captured output for this exact scenario is also already
+in `evidence/01_deterministic_replay/` if you'd rather not run anything:
+
+```bash
+curl -s -X POST http://localhost:8000/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "capability_id": "get_savings_balance",
+        "vendor": "meridian-demo",
+        "application": "credit-union-admin",
+        "version": "1.0.1",
+        "tenant_id": "base",
+        "inputs": {"member_id": "M1001"}
+      }'
+```
+
+Expect `"outcome": "success"` and `"outputs": {"savings_balance":
+"18204.55"}` -- no LLM call, no human approval, pure `ReplayEngine`
+against the live demo app. Try `"member_id": "no-such-member"` for the
+`business_outcome`/`MEMBER_NOT_FOUND` path (`evidence/02_business_outcome/`),
+or `"member_id": "Smith"` for the hard-failure/intervention path
+(`evidence/03_hard_failure_and_diagnostics/`).
+
+**(b) Optional genuine live Anthropic discovery -- requires
+`ANTHROPIC_API_KEY` in `.env` before `docker compose up`.** Asks for a
+capability that does not exist yet and supplies a `discovery_goal`, so a
+real Claude model proposes actions against the live demo app one step at
+a time, gated by policy approval (see "Human handoff" below for how to
+approve/resume, or watch/drive it live via noVNC, path (d)):
+
+```bash
+curl -s -X POST http://localhost:8000/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "capability_id": "discover_savings_balance_demo",
+        "vendor": "meridian-demo",
+        "application": "credit-union-admin",
+        "version": "1.0.0",
+        "tenant_id": "base",
+        "inputs": {},
+        "discovery_goal": {
+          "description": "Read the member'"'"'s savings account balance from the accounts table shown on this page (the row where the account type is Savings) and report its value.",
+          "start_url": "http://demo-app:8080/members/M1001/accounts"
+        }
+      }'
+```
+
+This does spend real Anthropic API usage and will very likely pause at
+`"outcome": "approval_required"` with a non-null `intervention_id` and
+`session_id` -- see the "Manual verification checklist" below for how to
+claim/resume it (steps 6-9), or drive it interactively via noVNC (path
+(d)). A full real transcript of this exact scenario, including two
+locator failures and two rounds of the model correcting its own
+semantically-wrong reads before landing on the right one, is preserved
+in `evidence/05_live_llm_discovery/` -- read that first if you want to
+know what to expect before spending API usage on it yourself.
+
+**(c) Deterministic replay after discovery.** Once (b) has completed
+successfully once (`"discovered_new_capability": true`), a real artifact
+now exists on disk. Re-issue the *exact same* `curl` command from (b)
+again: this second time `capability_match_found` resolves immediately
+(no `discovery_goal` handling needed even though it's still in the
+request body -- a match short-circuits discovery entirely), and the
+response comes back from `ReplayEngine` alone, same as path (a) -- no
+Anthropic call, no approval, no `discovery_engine` events in the log.
+`evidence/05_live_llm_discovery/060199268dd84a509d98f2c04a320511.jsonl`
+is a real captured log of exactly this.
+
+**(d) Human handoff / noVNC demo.** Watch or drive the exact live
+browser session behind either (a)'s intervention path or (b)'s
+discovery approvals at
+`http://localhost:6080/vnc.html?autoconnect=true&resize=scale`. See the
+"Manual verification checklist" below for the full click-by-click flow,
+and `evidence/04_human_handoff_and_resume/` for two real, complete runs
+of it.
 
 Once both services report healthy:
 

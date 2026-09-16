@@ -1,0 +1,19 @@
+{
+  "_note": "The running system does not persist raw HTTP response bytes anywhere on disk (no data/runs/ or similar store exists in this repo) -- same caveat as evidence/01 and evidence/02's reconstructed_run_response.json files. This object is reconstructed by mapping the real, persisted event log in 1ce8002332b94aeaa4397eff7e0fb1e0.jsonl (this folder) onto the real RunResponse schema (src/cuas/api/schemas.py) and RunOrchestrator's own SUCCESS-branch result construction: outputs are the discovered artifact's three declared output values, each as actually captured by the discovery run's own executed reads (read_value fields in discovery_trace_1ce8002332b94aeaa4397eff7e0fb1e0.json, same folder) -- not independently re-derived or invented. This matches the discovery outcome the developer reported after actually issuing this request through the real Docker container: outcome success, discovered_new_capability true, artifact_version 1.0.0.",
+  "run_id": "1ce8002332b94aeaa4397eff7e0fb1e0",
+  "capability_id": "discover_savings_balance_demo",
+  "outcome": "success",
+  "outputs": {
+    "savings_account_balance": "Balance",
+    "savings_account_balance_value": "2340.10",
+    "savings_balance_from_savings_row": "18204.55"
+  },
+  "business_outcome_code": null,
+  "error_code": null,
+  "error_message": null,
+  "reason": null,
+  "intervention_id": null,
+  "session_id": null,
+  "artifact_version": "1.0.0",
+  "discovered_new_capability": true
+}

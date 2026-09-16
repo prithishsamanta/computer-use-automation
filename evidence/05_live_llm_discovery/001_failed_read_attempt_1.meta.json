@@ -1,0 +1,15 @@
+{
+  "run_id": "1ce8002332b94aeaa4397eff7e0fb1e0",
+  "step_id": "0",
+  "captured_at": "2026-09-16T02:25:44.176638Z",
+  "reason": "action_execution_failed",
+  "error_code": null,
+  "error_message": "Could not resolve target for read: tried 1 candidate(s); last candidate (css) failed: Locator.wait_for: SyntaxError: Failed to execute 'querySelectorAll' on 'Element': 'td:first-child:contains(\"Savings\")' is not a valid selector.",
+  "url": "http://demo-app:8080/members/M1001/accounts",
+  "recent_actions": [
+    "0:approval_required"
+  ],
+  "screenshot_path": "001_0.png",
+  "dom_snapshot_path": "001_0.dom.json",
+  "screenshot_is_unredacted_pii_risk": true
+}

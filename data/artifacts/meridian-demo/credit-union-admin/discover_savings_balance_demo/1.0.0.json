@@ -1,0 +1,88 @@
+{
+  "capability_id": "discover_savings_balance_demo",
+  "name": "Discover Savings Balance Demo",
+  "description": "Read the member's savings account balance from the accounts table shown on this page (the row where the account type is Savings) and report its value.",
+  "version": "1.0.0",
+  "application": {
+    "vendor": "meridian-demo",
+    "application": "credit-union-admin",
+    "supported_versions": [
+      "1.0.0"
+    ]
+  },
+  "tenant_scope": "base",
+  "inputs": {},
+  "outputs": {
+    "savings_account_balance": {
+      "type": "string",
+      "source": {
+        "primary": {
+          "strategy": "css",
+          "params": {
+            "selector": "tr:has(td:nth-child(1)) td:nth-child(3)"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      },
+      "required": true
+    },
+    "savings_account_balance_value": {
+      "type": "decimal",
+      "source": {
+        "primary": {
+          "strategy": "css",
+          "params": {
+            "selector": "tr:nth-child(2) td:nth-child(3)"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      },
+      "required": true
+    },
+    "savings_balance_from_savings_row": {
+      "type": "decimal",
+      "source": {
+        "primary": {
+          "strategy": "role_name",
+          "params": {
+            "role": "cell",
+            "name": "$18204.55"
+          },
+          "frame": null
+        },
+        "fallbacks": []
+      },
+      "required": true
+    }
+  },
+  "steps": [
+    {
+      "id": "navigate_to_discovery_start",
+      "action_type": "navigate",
+      "intent": "open_start_page",
+      "target": null,
+      "value": "http://demo-app:8080/members/M1001/accounts",
+      "risk": "safe",
+      "wait": {
+        "timeout_ms": 5000
+      },
+      "checkpoint": null
+    }
+  ],
+  "success_condition": {
+    "type": "output_valid",
+    "output": "savings_account_balance"
+  },
+  "business_outcomes": [],
+  "recoverable_conditions": [],
+  "safety": {
+    "intent": "savings_balance_from_savings_row",
+    "risk": "safe"
+  },
+  "provenance": {
+    "created_from_run": "1ce8002332b94aeaa4397eff7e0fb1e0",
+    "created_at": "2026-09-16T02:32:34.926066Z"
+  }
+}
