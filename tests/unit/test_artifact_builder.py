@@ -128,6 +128,67 @@ def test_clean_successful_trace_becomes_an_artifact() -> None:
     assert "risk" in artifact.steps[0].model_fields_set
 
 
+# ---------------------------------------------------------------------------
+# success_condition output selection -- real run 1ce8002332b94aeaa4397eff7e0fb1e0
+# (DECISIONS_LOG.md) discovered a genuine capability with three distinct,
+# all-`executed` READs before "done": two technically-successful but
+# semantically wrong intermediate reads (a table header, then a different
+# account's balance), corrected by a third. None of those three READs are
+# an exact adjacent repeat of the one before it, so none get deduplicated
+# -- all three legitimately become outputs (that part is unchanged, out of
+# scope here). The bug this fix targets: `success_condition` used to
+# anchor to the *first* output built (`next(iter(outputs))`), which is
+# whichever READ happened to execute first -- in that real run, the
+# meaningless header-text one -- not the one that actually represents the
+# capability's result.
+# ---------------------------------------------------------------------------
+
+
+def test_a_single_read_output_is_still_the_success_condition_output() -> None:
+    """The one-output case must be unaffected by this fix: with only one
+    output to choose from, first and last are the same thing."""
+
+    artifact = ArtifactBuilder().build(_trace(_happy_path_steps()), _goal(), CONTEXT)
+
+    assert list(artifact.outputs) == ["savings_balance"]
+    assert artifact.success_condition.output == "savings_balance"
+
+
+def test_multiple_executed_reads_use_the_last_one_as_the_success_condition_output() -> None:
+    """Reproduces run 1ce8002332b94aeaa4397eff7e0fb1e0's exact shape: three
+    distinct, non-adjacent, all-`executed` READs -- a wrong header read, a
+    wrong different-account read, then the correct one -- before "done".
+    All three still become outputs (unchanged, out of scope for this fix);
+    only which one the generated success condition points at changes."""
+
+    steps = [
+        _step(0, "read", "read_savings_account_balance", target=_css("tr:has(td:nth-child(1)) td:nth-child(3)"), read_value="Balance"),
+        _step(1, "read", "read_savings_account_balance_value", target=_css("tr:nth-child(2) td:nth-child(3)"), read_value="$2340.10"),
+        _step(2, "read", "read_savings_balance_from_savings_row", target=_role("cell", "$18204.55"), read_value="$18204.55"),
+    ]
+    goal = _goal(start_url="http://demo-app.invalid/members/M1001/accounts")
+
+    artifact = ArtifactBuilder().build(_trace(steps), goal, CONTEXT)
+
+    # Unchanged by this fix: every kept READ still becomes an output, in
+    # trace order, and the leading synthetic NAVIGATE is still the only step.
+    assert list(artifact.outputs) == [
+        "savings_account_balance",
+        "savings_account_balance_value",
+        "savings_balance_from_savings_row",
+    ]
+    assert len(artifact.steps) == 1
+    assert artifact.steps[0].action_type == ActionType.NAVIGATE
+    assert artifact.steps[0].id == "navigate_to_discovery_start"
+    assert artifact.steps[0].value == goal.start_url
+
+    # What this fix actually changes: the success condition now points at
+    # the last output (the correct, final READ), not the first (the
+    # meaningless header-text one).
+    assert artifact.success_condition.output == "savings_balance_from_savings_row"
+    assert artifact.success_condition.output != "savings_account_balance"
+
+
 def test_trace_with_a_wrong_turn_detour_produces_an_artifact_without_it() -> None:
     steps = [
         _step(0, "fill", "enter_member_id", target=_role("textbox"), value="{{member_id}}"),

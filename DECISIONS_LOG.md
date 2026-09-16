@@ -2461,3 +2461,64 @@ error handling; session persistence; duration accounting; policy;
 still requires a fresh discovery run after a container restart (same
 constraint as `cfefe84` -- no hot-reload path exists), which is deferred
 to when Docker is actually restarted.
+
+### Bugfix (post-live-run investigation) -- ArtifactBuilder's generated success condition pointed at the first executed READ instead of the last
+
+Live run `1ce8002332b94aeaa4397eff7e0fb1e0` produced a genuinely
+successful capability with three distinct, all-`executed` READs before
+"done": two technically-successful but semantically wrong intermediate
+reads (a table header read as `"Balance"`, then the Checking account's
+`"$2340.10"` read under a different intent), corrected by a third
+(`role_name(cell, "$18204.55")`) once the model noticed the mismatch.
+None of the three are an exact adjacent repeat of the one before it, so
+`_deduplicate_adjacent` correctly keeps all three, and all three
+correctly become outputs -- that part of `ArtifactBuilder` is unchanged
+and out of scope here. The bug: `build()` set
+`success_condition = SuccessCondition(type=OUTPUT_VALID,
+output=next(iter(outputs)))` -- the *first* output built, i.e. whichever
+READ happened to execute first. For this run that was
+`savings_account_balance` (the meaningless header-text one), even though
+`_overall_intent`, a few lines later in the same method, already treats
+the *last* action as "the one that produces the capability's actual
+result." The two pieces of reasoning disagreed inside one `build()` call.
+
+**Fix:** one line, `next(iter(outputs))` -> `next(reversed(outputs))`.
+`outputs` is a plain dict built by iterating `kept_steps` in trace order,
+so insertion order already is trace order -- this is the same
+deterministic ordering `_overall_intent` already relies on, not a new
+heuristic, no semantic scoring, no LLM involvement anywhere in
+`ArtifactBuilder` (unchanged: it has none).
+
+**Explicitly unchanged, per instruction:** which executed READs become
+outputs (still all of them -- the two wrong intermediate reads for this
+capability are still present in `artifact.outputs`, just no longer the
+success-condition target); locator generation; the
+`role_name(cell, "$18204.55")` value-bound locator; discovery engine;
+`AnthropicLLMClient`; replay engine; policy; capability service; session
+persistence.
+
+**Tests:** `tests/unit/test_artifact_builder.py` (+2) --
+`test_a_single_read_output_is_still_the_success_condition_output`
+(one-output case is unaffected, first and last coincide) and
+`test_multiple_executed_reads_use_the_last_one_as_the_success_condition_output`
+(reproduces the real run's exact three-READ shape; asserts all three
+still become outputs in trace order, the leading synthetic NAVIGATE is
+still the only step, and the success condition now points at the last,
+correct output rather than the first). All 15 pre-existing tests in that
+file re-verified passing unchanged.
+
+**Verified:** Full deterministic suite: 223 passed (was 221), zero
+regressions, checksum-verified identical between the device repo and the
+cloud-sandbox round-trip. Full integration suite: 18 passed, including
+`test_artifact_builder_e2e.py` (a real engine run through the real
+builder, replayed for real). No Anthropic call was made; Docker was not
+restarted. The live artifact
+(`data/artifacts/meridian-demo/credit-union-admin/discover_savings_balance_demo/1.0.0.json`),
+its capability record, the discovery trace it was built from, and both
+still-pending interventions
+(`76737908f0564b31b3b123712ca74960`, `ff2fc8361e614b0c97a9955b6018245c`)
+were read-only throughout and remain exactly as they were -- this fix
+only changes what a *future* `ArtifactBuilder.build()` call produces.
+Confirmed directly: the already-stored `1.0.0.json` still reads
+`success_condition.output: "savings_account_balance"` after this commit,
+since nothing rematerializes an existing artifact automatically.

@@ -159,7 +159,21 @@ class ArtifactBuilder:
                 "cannot derive a typed output or success condition"
             )
 
-        success_condition = SuccessCondition(type=SuccessConditionType.OUTPUT_VALID, output=next(iter(outputs)))
+        # The *last* kept output, not the first: mirrors _overall_intent's
+        # own reasoning a few lines below ("the capability's own
+        # summarizing intent is the last action taken -- the one that
+        # produces the capability's actual result"), applied consistently
+        # here too. `outputs` is a plain dict built by iterating kept_steps
+        # in trace order (see _build_outputs), so insertion order IS trace
+        # order -- a deterministic, already-available ordering, not a new
+        # heuristic. Matters whenever discovery's successful path contains
+        # more than one kept READ (e.g. an earlier READ that executed but
+        # read the wrong thing, corrected by a later one before "done" --
+        # see DECISIONS_LOG.md, run 1ce8002332b94aeaa4397eff7e0fb1e0): the
+        # first output built is whichever READ happened to run first, which
+        # is not necessarily -- and in that real run, was not -- the one
+        # that actually represents the capability's result.
+        success_condition = SuccessCondition(type=SuccessConditionType.OUTPUT_VALID, output=next(reversed(outputs)))
 
         resolved_capability_id = capability_id or trace.capability_id
         # Computed from the model-driven steps only, before the
