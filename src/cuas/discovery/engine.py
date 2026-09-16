@@ -273,12 +273,18 @@ class DiscoveryEngine:
             consecutive_repeats = 0
             total_tokens = 0
             # Set once a "done" claim is rejected for producing no
-            # materializable progress (see _has_materializable_progress) --
-            # from then on, every subsequent turn's observation carries a
-            # reminder until the model actually executes a READ. Never
-            # cleared back to False: once real progress exists, a later
-            # "done" simply succeeds regardless of this flag's value, so
-            # there is nothing to reset.
+            # materializable progress (see _has_materializable_progress).
+            # Never cleared back to False by itself -- but the reminder it
+            # controls is only actually shown while _has_materializable_progress
+            # is still False (see the observation-building gate below), so
+            # once a READ genuinely executes, the reminder stops appearing
+            # on its own without needing a second flag or an explicit
+            # reset. Real run e4f7901c680c4f2690e3b9f127e785fd
+            # (DECISIONS_LOG.md) showed the earlier version of this -- the
+            # reminder shown unconditionally once set -- kept instructing
+            # the model to "propose one concrete action... before
+            # declaring done again" even on the turn immediately after it
+            # already had, which is exactly backwards.
             needs_progress_reminder = False
 
         # Not part of DiscoveryPendingApproval (3904afe) by design -- a
@@ -369,7 +375,7 @@ class DiscoveryEngine:
             # model gets the reminder appended, so the persisted trace
             # never mixes real page content with injected system text.
             observation_for_model = observation
-            if needs_progress_reminder:
+            if needs_progress_reminder and not self._has_materializable_progress(history):
                 observation_for_model = Observation(
                     url=observation_for_model.url,
                     visible_text=observation_for_model.visible_text + "\n\n" + _PROGRESS_REMINDER_TEXT,

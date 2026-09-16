@@ -17,8 +17,10 @@ test_playwright_adapter_error_sanitization.py).
 from __future__ import annotations
 
 from cuas.discovery.anthropic_client import (
+    _MAX_READ_VALUE_CHARS,
     _MAX_TARGET_DETAIL_CHARS,
     AnthropicLLMClient,
+    _describe_read_value,
     _describe_target,
     _quote,
 )
@@ -172,3 +174,105 @@ def test_action_value_is_never_included_even_for_execution_failed() -> None:
     message = AnthropicLLMClient._build_user_message(None, _goal(), _observation(), [entry])
     assert "M1001-SUPER-SECRET-LOOKING-VALUE" not in message
     assert "target=" in message
+
+
+# --- _describe_read_value ----------------------------------------------------
+
+
+def test_describe_read_value_returns_the_value_unchanged_when_short() -> None:
+    assert _describe_read_value("$18204.55") == "$18204.55"
+
+
+def test_describe_read_value_collapses_embedded_whitespace_to_one_line() -> None:
+    assert _describe_read_value("  $18204.55 \n  Open  ") == "$18204.55 Open"
+
+
+def test_describe_read_value_truncates_a_long_value() -> None:
+    result = _describe_read_value("x" * 500)
+    assert len(result) == _MAX_READ_VALUE_CHARS + 3  # + "..."
+    assert result.endswith("...")
+
+
+# --- _build_user_message: successful READ result inclusion ------------------
+
+
+def test_executed_read_with_a_value_includes_it_in_history() -> None:
+    """Real run e4f7901c680c4f2690e3b9f127e785fd (DECISIONS_LOG.md): a
+    successful READ's captured value must now reach the next turn's
+    history line, not just the bare "-> executed" the model previously
+    received."""
+
+    entry = DiscoveryHistoryEntry(
+        step_index=3,
+        action=_action(target=_css_target("#balance")),
+        outcome="executed",
+        read_value="$18204.55",
+    )
+    message = AnthropicLLMClient._build_user_message(None, _goal(), _observation(), [entry])
+
+    expected_line = (
+        "- step 3: proposed read (intent='read_savings_account_balance') "
+        '-> executed (read_value="$18204.55")'
+    )
+    assert expected_line in message
+
+
+def test_executed_read_with_a_value_is_bounded() -> None:
+    entry = DiscoveryHistoryEntry(
+        step_index=3,
+        action=_action(target=_css_target("#balance")),
+        outcome="executed",
+        read_value="x" * 500,
+    )
+    message = AnthropicLLMClient._build_user_message(None, _goal(), _observation(), [entry])
+    assert "x" * 500 not in message
+    assert ("x" * _MAX_READ_VALUE_CHARS + "...") in message
+
+
+def test_executed_without_a_read_value_gets_no_read_value_detail() -> None:
+    """A non-READ action (e.g. CLICK/FILL) that executed successfully has
+    no `read_value` at all (DiscoveryHistoryEntry's own docstring: "None
+    otherwise") -- this must not fabricate one."""
+
+    entry = DiscoveryHistoryEntry(
+        step_index=2,
+        action=_action(action_type=ActionType.CLICK, intent="view_account", target=_css_target("#search")),
+        outcome="executed",
+        read_value=None,
+    )
+    message = AnthropicLLMClient._build_user_message(None, _goal(), _observation(), [entry])
+    assert "read_value=" not in message
+
+
+def test_non_executed_outcomes_never_get_read_value_detail_even_if_somehow_set() -> None:
+    for outcome in ("execution_failed", "policy_denied", "approval_required"):
+        entry = DiscoveryHistoryEntry(
+            step_index=3,
+            action=_action(target=_css_target("#balance")),
+            outcome=outcome,
+            read_value="$18204.55",
+            error_message="irrelevant" if outcome == "execution_failed" else None,
+        )
+        message = AnthropicLLMClient._build_user_message(None, _goal(), _observation(), [entry])
+        assert "read_value=" not in message, f"outcome={outcome!r} unexpectedly included read_value detail"
+
+
+def test_action_value_is_never_included_for_a_successful_read_either() -> None:
+    """Mirrors test_action_value_is_never_included_even_for_execution_failed
+    above, for the new success-side rendering: a FILL action's typed
+    value must never leak into history just because it happened to
+    execute successfully."""
+
+    entry = DiscoveryHistoryEntry(
+        step_index=1,
+        action=_action(
+            action_type=ActionType.FILL,
+            intent="search_member",
+            target=_css_target("#member-id-input"),
+            value="M1001-SUPER-SECRET-LOOKING-VALUE",
+        ),
+        outcome="executed",
+        read_value=None,
+    )
+    message = AnthropicLLMClient._build_user_message(None, _goal(), _observation(), [entry])
+    assert "M1001-SUPER-SECRET-LOOKING-VALUE" not in message

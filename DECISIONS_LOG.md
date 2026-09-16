@@ -2390,3 +2390,74 @@ files touched -- 2 source (`src/cuas/surface/playwright_adapter.py`,
 files (`tests/unit/test_playwright_adapter_error_sanitization.py`,
 `tests/unit/test_anthropic_user_message.py`) -- no unintended changes,
 no secrets, no page content, no full tracebacks persisted anywhere.
+
+### Robustness fix (post-live-LLM-run investigation) -- a successful READ's result and completion-readiness were never fed back to the model, so it repeated the READ instead of declaring done
+
+Read-only inspection of live run `e4f7901c680c4f2690e3b9f127e785fd`
+found: step 3 executed a READ and recorded `read_value="$18204.55"`; the
+very next Anthropic turn was told only `-> executed`, with no result and
+no signal that this already satisfied `_has_materializable_progress` (the
+model was still receiving `_PROGRESS_REMINDER_TEXT`, latched on by an
+earlier rejected `done=true` and never turned off), and the system
+prompt's own completion rule ("done once the page already shows the
+result") never distinguished that from "a READ has actually captured it
+for replay." The model reasonably proposed the identical READ again
+instead of finishing.
+
+Three narrow, symmetric fixes, all upstream of `engine.py`'s actual
+gating logic (`_has_materializable_progress`/`_verify_success_checkpoint`
+themselves untouched -- they were already correct):
+
+1. `anthropic_client.py`'s `_build_user_message` now renders a
+   successful READ's `read_value` into its history line (`_describe_read_value`:
+   collapsed to one line, bounded to 200 chars, mirroring
+   `_describe_target`/`_sanitize_underlying_error`'s existing pattern),
+   gated on `outcome == "executed" and entry.read_value is not None` --
+   which, per `DiscoveryHistoryEntry`'s own docstring, can only ever be a
+   READ, so this can never attach to a FILL's typed value or any other
+   action.
+2. `engine.py`'s reminder gate changed from `if needs_progress_reminder:`
+   to `if needs_progress_reminder and not
+   self._has_materializable_progress(history):` -- deriving suppression
+   from the same check `done` is already gated on, rather than adding a
+   second state variable. The flag itself is still never reset (as
+   before); its effect now naturally stops once real progress exists.
+3. The system prompt's single done=true sentence was expanded (still
+   fully generic -- no run, selector, or app specifics) to state the
+   actual two-part rule: an executed READ is required before completion,
+   and once one has produced the result, declare done rather than
+   repeating it.
+
+**Tests:** `tests/unit/test_anthropic_user_message.py` (+8) --
+`_describe_read_value`'s single-line collapsing/truncation; a successful
+READ's `read_value` appears in its history line (exact-string match); a
+non-READ or valueless `executed` entry gets no `read_value=`; every
+non-`executed` outcome never gets one even if `read_value` were
+(incorrectly) set; `Action.value` still never leaks for a successful
+entry either. `tests/unit/test_discovery_engine.py` (+1) --
+`test_progress_reminder_stops_once_a_read_has_executed` reproduces the
+real sequence end-to-end (rejected done -> READ executes -> reminder
+gone -> done accepted -> SUCCESS), asserting the reminder text is present
+before the READ and absent after, even though the flag was never reset.
+All 32 pre-existing tests in that file (malformed-output recovery,
+`3904afe` approval/resume, repeat detection) re-verified passing
+unchanged.
+
+**Verified:** Full deterministic suite: 221 passed (was 212), zero
+regressions, checksum-verified identical between the device repo and the
+cloud-sandbox round-trip. Full integration suite: 18 passed (unchanged
+count -- no browser-facing code touched). No Anthropic call was made.
+Interventions `76737908f0564b31b3b123712ca74960` and
+`ff2fc8361e614b0c97a9955b6018245c`, and every trace/log/evidence file
+from any real run, were read-only throughout and remain untouched
+(`ff2fc836...` confirmed still `pending` after this fix). Docker was not
+restarted for this commit.
+
+**Explicitly out of scope, per instruction, all untouched:** the
+`role_name(cell, "$18204.55")` value-as-locator generalization concern;
+locator scoring/redesign; `_action_signature`/repeat detection; provider-
+error handling; session persistence; duration accounting; policy;
+`ArtifactBuilder`. Verifying this fix against a real Anthropic turn
+still requires a fresh discovery run after a container restart (same
+constraint as `cfefe84` -- no hot-reload path exists), which is deferred
+to when Docker is actually restarted.

@@ -34,7 +34,7 @@ from typing import Any
 
 from cuas.discovery.llm_client import LLMClient, LLMResponse
 from cuas.discovery.models import DiscoveryGoal, DiscoveryHistoryEntry
-from cuas.domain import AppContext, LocatorStrategy, Target
+from cuas.domain import ActionType, AppContext, LocatorStrategy, Target
 from cuas.surface.adapter import Observation
 
 _TOOL_NAME = "propose_action"
@@ -171,6 +171,38 @@ def _describe_target(target: Target) -> str:
     return description
 
 
+# Bound on a rendered READ result folded into a successful history line
+# (see _describe_read_value) -- same purpose as _MAX_TARGET_DETAIL_CHARS
+# above: a single short, predictable addition regardless of how long a
+# real page value gets.
+_MAX_READ_VALUE_CHARS = 200
+
+
+def _describe_read_value(value: str) -> str:
+    """A compact, bounded, single-line rendering of a successful READ's
+    captured value -- `DiscoveryHistoryEntry.read_value` is only ever set
+    for an executed READ (its own docstring: "None otherwise"), and is
+    exactly the value `ArtifactBuilder` would later materialize into a
+    typed output -- the same raw-history-is-correct reasoning
+    `_describe_target` already relies on, never `Action.value` (what a
+    FILL/similar action typed, not what a READ captured). Collapsed to one
+    line (a READ can return text with embedded newlines from the page)
+    and bounded, for the same reason _describe_target/
+    _sanitize_underlying_error are: a single predictable addition to the
+    prompt, never an unbounded dump of arbitrary page content.
+
+    Real run e4f7901c680c4f2690e3b9f127e785fd (DECISIONS_LOG.md) showed a
+    successful READ's result was never included in history at all: the
+    very next turn was only told "-> executed", with no way to know what
+    had actually been read or that it already satisfied the goal, so the
+    model proposed the identical READ again instead of declaring done."""
+
+    text = " ".join(value.split())
+    if len(text) > _MAX_READ_VALUE_CHARS:
+        text = text[:_MAX_READ_VALUE_CHARS] + "..."
+    return text
+
+
 class AnthropicLLMClient(LLMClient):
     def __init__(
         self,
@@ -240,9 +272,14 @@ class AnthropicLLMClient(LLMClient):
             "been loaded once for you). Prefer role_name locators (accessibility role "
             "plus visible name) over css selectors when a control's role and name are "
             "both apparent from the page text; fall back to a css selector only when "
-            "you can reasonably infer one from context. Set done=true, with no other "
-            "field except reasoning, once the current page already shows the "
-            "information or result the goal describes."
+            "you can reasonably infer one from context. If the goal asks you to find, "
+            "read, or report a value, seeing it on the page is not enough by itself -- "
+            "at least one READ action you propose must actually execute and capture "
+            "that value first, since only an executed READ can be replayed later. Once "
+            "a READ you proposed has executed and its result (shown in your history as "
+            "read_value) is the result the goal describes, set done=true, with no other "
+            "field except reasoning, instead of proposing another READ for the same "
+            "value."
         )
 
     def _build_user_message(
@@ -264,6 +301,14 @@ class AnthropicLLMClient(LLMClient):
                 target_detail = ""
                 if entry.outcome == "execution_failed" and entry.action.target is not None:
                     target_detail = f", target={_describe_target(entry.action.target)}"
+                # Symmetric fix for the success side: a READ that actually
+                # executed carries the value it captured (see
+                # _describe_read_value) -- `read_value` is only ever set
+                # for an executed READ, never for any other action type or
+                # outcome, so this can't accidentally attach to a FILL/
+                # CLICK/etc. or to a failed/pending turn.
+                if entry.outcome == "executed" and entry.read_value is not None:
+                    detail = f" (read_value={_quote(_describe_read_value(entry.read_value))})"
                 lines.append(
                     f"- step {entry.step_index}: proposed {entry.action.action_type.value} "
                     f"(intent={entry.action.intent!r}{target_detail}) -> {entry.outcome}{detail}"

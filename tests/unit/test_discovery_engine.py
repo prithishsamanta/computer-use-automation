@@ -572,6 +572,46 @@ async def test_done_after_a_materializable_read_succeeds() -> None:
 
 
 @pytest.mark.asyncio
+async def test_progress_reminder_stops_once_a_read_has_executed() -> None:
+    """Real run e4f7901c680c4f2690e3b9f127e785fd (DECISIONS_LOG.md): after
+    a rejected "done" set the standing reminder, a READ later executed
+    successfully -- but the reminder kept appearing on every subsequent
+    turn anyway (the flag was never reset), so a fresh Anthropic call
+    right after that success was still told "propose one concrete
+    action... before declaring done again" and proposed the identical
+    READ instead of finishing. The fix derives whether to show the
+    reminder from _has_materializable_progress(history) itself rather
+    than a second flag, so it stops on its own the moment real progress
+    exists."""
+
+    from cuas.domain import Locator, LocatorStrategy, Target
+
+    fake = FakeSurfaceAdapter()
+    balance_target = Target(primary=Locator(strategy=LocatorStrategy.ROLE_NAME, params={"role": "text", "name": "Savings Balance"}))
+    fake.script_read(balance_target, "$18204.55")
+
+    llm = FakeLLMClient(
+        propose_done("the balance is already visible on the page"),  # rejected -> sets the flag
+        propose("read", "view_account", target=role_target("text", "Savings Balance")),  # executes -> materializable progress now exists
+        propose_done("now recorded a READ of the balance"),
+    )
+
+    result = await _engine(fake, llm).run(_goal(), CONTEXT)
+
+    assert result.status == DiscoveryStatus.SUCCESS
+    assert len(llm.calls) == 3
+    # Call 1 (before any rejection): no reminder yet.
+    assert "replayed automatically later" not in llm.calls[0][2].visible_text
+    # Call 2 (post-rejection, pre-READ): the existing corrective behavior
+    # is unchanged -- the reminder is present.
+    assert "replayed automatically later" in llm.calls[1][2].visible_text
+    # Call 3 (post-READ): materializable progress now exists, so the
+    # reminder must no longer be shown even though the flag itself was
+    # never reset back to False.
+    assert "replayed automatically later" not in llm.calls[2][2].visible_text
+
+
+@pytest.mark.asyncio
 async def test_flows_with_materializable_progress_are_unaffected_by_the_new_gate() -> None:
     """A flow that already executes a READ before its first "done" must
     behave exactly as it did before this fix: no extra corrective turn,
